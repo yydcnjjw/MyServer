@@ -11,37 +11,50 @@
 namespace MyServer {
 typedef std::multimap<std::string, std::string> Headers;
 typedef std::multimap<std::string, std::string> Params;
+typedef std::multimap<std::string, std::string> Querys;
+
+class Url {
+  public:
+    std::string host;
+    std::string path;
+    Querys querys;
+    Querys AddParam(const std::string &key, const std::string &value);
+    Querys RemoveParam(const std::string &key);
+};
 
 typedef struct MultipartFile {
     std::string filename;
     std::string content_type;
+    File *file = nullptr;
     size_t offset = 0;
     size_t length = 0;
 } MultipartFile;
 typedef std::multimap<std::string, MultipartFile> MultipartFiles;
 
-class HttpResponse {
+class HttpMessage {
   public:
     std::string version;
-    int status;
     Headers headers;
     std::string body;
+    Headers AddHeader();
+    Headers RemoveHeader();
 };
 
-class HttpRequest {
+class HttpResponse : public HttpMessage {
   public:
-    std::string version;
+    int status;
+};
+
+class HttpRequest : public HttpMessage {
+  public:
     std::string method;
     std::string target;
     std::string path;
-    Headers headers;
-    std::string body;
     Params params;
     MultipartFiles files;
 };
 
-typedef std::function<void(const HttpRequest &, HttpResponse &)>
-    HttpHandleFunc;
+typedef std::function<void(const HttpRequest &, HttpResponse &)> HttpHandleFunc;
 
 struct HttpHandler {
     std::regex pattern;

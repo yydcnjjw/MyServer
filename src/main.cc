@@ -13,10 +13,10 @@ int main(int argc, char *argv[]) {
         return -1;
     }
     HttpServer *server = result.Get();
-    server
-        ->Get("/", [](const HttpRequest &req, HttpResponse &res) {
-		       
-		   });
+    server->Get("/", [](const HttpRequest &req, HttpResponse &res) {
+        cout << "Hello World!" << endl;
+    });
+
     server->Listen("localhost", "8080");
     server->Start();
     return 0;

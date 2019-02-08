@@ -1,3 +1,4 @@
+
 #include "http_server.h"
 
 #include <unistd.h>
@@ -199,9 +200,8 @@ class HttpRequestReadListener : public Listener {
         : server_(server), connect_socket_(connectSocket),
           req_(new HttpRequest), res_(new HttpResponse),
           reader_(FileReader(connect_socket_->GetFd())), log_(nullptr),
-          is_request_line_read_(false), is_request_header_read_(false),
-          is_request_body_read_(false), body_progress(0), connect_close_(true) {
-    }
+          parse_status_(ParseStatus::request_line), buf_progress_(0),
+          body_progress_(0), connect_close_(true) {}
 
     ~HttpRequestReadListener() override{};
 
@@ -235,47 +235,54 @@ class HttpRequestReadListener : public Listener {
         res_->version = HTTP_V1_1;
         res_->status = -1;
 
-        result = parse_request_line();
-        if (!result.IsOK()) {
-            return result;
+        while (parse_status_ != ParseStatus::finish) {
+            switch (parse_status_) {
+            case ParseStatus::request_line: {
+                result = parse_request_line();
+                break;
+            }
+            case ParseStatus::request_headers: {
+                result = parse_headers();
+                break;
+            }
+            case ParseStatus::post_query: {
+                result = parse_post_query();
+                break;
+            }
+            case ParseStatus::multipart_read_header: {
+                result = parse_multipart_formdata_header();
+                break;
+            }
+            case ParseStatus::multipart_read_file: {
+                result = parse_multipart_formdata_file();
+                break;
+            }
+            case ParseStatus::route: {
+                if (route_handle()) {
+                    res_->status = 200;
+                } else {
+                    res_->status = 404;
+                }
+                parse_status_ = ParseStatus::finish;
+                break;
+            }
+            default:
+                break;
+            }
+            if (!result.IsOK()) {
+                break;
+            }
         }
-
-        result = parse_headers();
-        if (!result.IsOK()) {
-            return result;
-        }
-
-        result = parse_body();
-        if (!result.IsOK()) {
-            return result;
-        }
-
-        // INFO: DEBUG
-        log_->Debug("param:");
-        for (const auto &param : req_->params) {
-            log_->Debug(param.first + "=" + param.second);
-        }
-        log_->Debug("");
-
-        if (route_handle()) {
-            res_->status = 200;
-        } else {
-            res_->status = 404;
-        }
-        return VoidResult::OK();
+        return result;
     }
 
     VoidResult parse_request_line() {
-        if (is_request_line_read_) {
-            return VoidResult::OK();
-        }
         std::string request_line;
         VoidResult result = read_line(request_line);
         if (!result.IsOK()) {
             return result;
         }
 
-        is_request_line_read_ = true;
         static std::regex re("(GET|HEAD|POST|PUT|DELETE|OPTIONS) "
                              "(([^?]+)(?:\\?(.+?))?) (HTTP/1\\.[01])\r\n");
 
@@ -290,12 +297,13 @@ class HttpRequestReadListener : public Listener {
                 parse_query_text(m[4], req_->params);
             }
             req_->version = std::string(m[5]);
+            parse_status_ = ParseStatus::request_headers;
             return VoidResult::OK();
         }
         return VoidResult::ErrorResult<HttpError>("parse request line fail!");
     }
 
-    inline void parse_query_text(const std::string &s, Params &params) {
+    void parse_query_text(const std::string &s, Params &params) {
         string_split(s, '&', [&](const std::string &query_field) {
             std::string key;
             std::string value;
@@ -311,9 +319,6 @@ class HttpRequestReadListener : public Listener {
     }
 
     VoidResult parse_headers() {
-        if (is_request_header_read_) {
-            return VoidResult::OK();
-        }
         static std::regex re(R"((.+?):\s*(.+?)\s*\r\n)");
         std::string header_line;
         VoidResult result;
@@ -323,9 +328,8 @@ class HttpRequestReadListener : public Listener {
             if (!result.IsOK()) {
                 return result;
             }
-
+            log_->Debug(header_line);
             if (!header_line.compare("\r\n")) {
-                is_request_header_read_ = true;
                 break;
             }
             std::cmatch m;
@@ -336,32 +340,224 @@ class HttpRequestReadListener : public Listener {
             }
             header_line.clear();
         }
-        return VoidResult::OK();
-    }
 
-    VoidResult parse_body() {
-        // parse Body
-        VoidResult result;
         if (req_->method == POST || req_->method == PUT) {
-            result = read_body();
-            if (!result.IsOK()) {
-                return result;
-            }
             auto content_type =
                 get_header_value_string(req_->headers, CONTENT_TYPE);
             if (!content_type.IsOK()) {
                 return content_type;
             }
-            if (!content_type.Get().find("application/x-www-form-urlencoded")) {
-                parse_query_text(req_->body, req_->params);
-            } else if (!content_type.Get().find("multipart/form-data")) {
-                // TODO: Deferred file transmission
-                result = parse_multipart(content_type.Get());
+            if (!content_type.Get().find("multipart/form-data")) {
+                parse_status_ = ParseStatus::multipart_read_header;
+            } else if (!content_type.Get().find(
+                           "application/x-www-form-urlencoded")) {
+                parse_status_ = ParseStatus::post_query;
+            }
+        } else {
+            parse_status_ = ParseStatus::route;
+        }
+        return VoidResult::OK();
+    }
+
+    VoidResult parse_post_query() {
+        VoidResult result = read_body();
+        if (!result.IsOK()) {
+            return result;
+        }
+        parse_query_text(req_->body, req_->params);
+        parse_status_ = ParseStatus::route;
+        return VoidResult::OK();
+    }
+
+    VoidResult parse_multipart_formdata_header() {
+        VoidResult result;
+        static std::regex re_content_type("Content-Type: (.*?)\r\n",
+                                          std::regex_constants::icase);
+        static std::regex re_content_disposition(
+            "Content-Disposition: form-data; name=\"(.*?)\"(?:; "
+            "filename=\"(.*?)\")?\r\n",
+            std::regex_constants::icase);
+
+        std::string &body_content = multipart_data_buf_;
+        std::string header_line;
+        MultipartFileInfo &fileinfo = multipart_file_info_;
+        for (;;) {
+            if (body_content.empty()) {
+                result = read_line(header_line);
+                if (!result.IsOK()) {
+                    return result;
+                }
+                body_progress_ += header_line.size();
+            } else {
+                auto pos = body_content.find('\n');
+                if (pos == std::string::npos) {
+                    header_line.append(body_content);
+                    result = read_line(header_line);
+                    if (!result.IsOK()) {
+                        return result;
+                    }
+                    body_progress_ += header_line.size() - body_content.size();
+                    body_content.clear();
+                } else {
+                    header_line = body_content.substr(0, pos + 1);
+                    body_content.erase(0, pos + 1);
+                }
+            }
+
+            log_->Debug(header_line);
+
+            if (!header_line.compare("\r\n")) {
+                break;
+            }
+
+            std::smatch m;
+            if (std::regex_match(header_line, m, re_content_type)) {
+                // TODO: multipart/mixed support
+                fileinfo.file.content_type = m[1];
+            } else if (std::regex_match(header_line, m,
+                                        re_content_disposition)) {
+                fileinfo.name = m[1];
+                fileinfo.file.filename = m[2];
+            }
+            header_line.clear();
+        }
+        parse_status_ = ParseStatus::multipart_read_file;
+        return VoidResult::OK();
+    }
+
+    Result<std::string> get_boundary() {
+        auto content_type =
+            get_header_value_string(req_->headers, CONTENT_TYPE);
+        if (!content_type.IsOK()) {
+            return content_type;
+        }
+
+        auto boundary_pos = content_type.Get().find("boundary=");
+        if (boundary_pos == std::string::npos) {
+            return VoidResult::ErrorResult<HttpError>("parse multipart error");
+        }
+        return content_type.Get().substr(boundary_pos + 9);
+    }
+
+    VoidResult parse_multipart_formdata_file() {
+        VoidResult result;
+
+        static std::string dash = "--";
+        static std::string crlf = "\r\n";
+        static size_t crlf_size = crlf.size();
+
+        auto boundary_result = get_boundary();
+        if (!boundary_result.IsOK()) {
+            return result;
+        }
+        std::string boundary = boundary_result.Get();
+
+        auto content_length =
+            get_header_value_int(req_->headers, CONTENT_LENGTH);
+        if (!content_length.IsOK()) {
+            return VoidResult::ErrorResult<HttpError>("http format error");
+        }
+
+        size_t rest_body_len = content_length.Get() - body_progress_;
+        size_t read_size = 0;
+        static const size_t MAX_MULTIPART_READ_SIZE = 4 * 1024;
+        if (MAX_MULTIPART_READ_SIZE > rest_body_len) {
+            read_size = rest_body_len;
+        } else if (MAX_MULTIPART_READ_SIZE < rest_body_len) {
+            read_size = MAX_MULTIPART_READ_SIZE;
+        }
+
+        std::string dash_boundary = dash + boundary;
+        size_t dash_boundary_size = dash_boundary.size();
+        std::string &content = multipart_data_buf_;
+        size_t offset = content.size();
+        if (offset == 0) {
+            content.assign(read_size, 0);
+        }
+
+        if (body_progress_ != content_length.Get()) {
+            if (read_size < 4 * 1024) {
+                content.resize(read_size + offset);
+                result = read_len(&content[offset], read_size);
+                offset = 0;
+            } else {
+                content.resize(read_size);
+                result = read_len(&content[offset], read_size - offset);
+            }
+            if (!result.IsOK()) {
+                return result;
+            }
+            body_progress_ += (read_size - offset);
+        }
+
+        auto pos = content.find(crlf + dash_boundary);
+
+        bool is_read_finish = false;
+        if (pos == std::string::npos) {
+            pos = read_size - dash_boundary_size - crlf_size;
+        } else {
+            is_read_finish = true;
+        }
+
+        MultipartFileInfo &fileinfo = multipart_file_info_;
+        File **file = &fileinfo.file.file;
+        std::string filename = string_format("tmp_%s_%s", fileinfo.name.c_str(),
+                                             fileinfo.file.filename.c_str());
+        if (*file == nullptr) {
+
+            if (pos <
+                MAX_MULTIPART_READ_SIZE - dash_boundary_size - crlf_size) {
+                *file = new MemFile(filename);
+            } else {
+                *file = new File(filename);
+            }
+
+            if (!file) {
+                return VoidResult::ErrorResult<OutOfMemory>("allocate File");
+            }
+
+            if (!(*file)->IsOpen()) {
+                result = (*file)->Create();
                 if (!result.IsOK()) {
                     return result;
                 }
             }
+
+            multipart_file_writer_ = FileWriter((*file)->GetFileDesc());
         }
+
+        result = multipart_file_writer_.Write(&content[0], pos);
+        if (!result.IsOK()) {
+            return result;
+        }
+
+        fileinfo.file.length += pos;
+
+        if (is_read_finish) {
+            std::string boundary_rear =
+                content.substr(pos + crlf_size + dash_boundary_size, 2);
+            if (!boundary_rear.compare("\r\n")) {
+                content.erase(0, pos + crlf_size * 2 + dash_boundary_size);
+                parse_status_ = ParseStatus::multipart_read_header;
+            } else if (!boundary_rear.compare("--")) {
+                parse_status_ = ParseStatus::route;
+                content.clear();
+            }
+            req_->files.emplace(fileinfo.name, fileinfo.file);
+            log_->Debug(string_format("filename=%s,filesize=%d",
+                                      fileinfo.file.filename.c_str(),
+                                      fileinfo.file.length));
+            fileinfo.file.file = nullptr;
+            fileinfo.file.length = 0;
+            result = multipart_file_writer_.Flush();
+            if (!result.IsOK()) {
+                return result;
+            }
+
+        } else {
+            content.erase(0, pos);
+        }
+
         return VoidResult::OK();
     }
 
@@ -472,10 +668,6 @@ class HttpRequestReadListener : public Listener {
     }
 
     VoidResult read_body() {
-        if (is_request_body_read_) {
-            return VoidResult::OK();
-        }
-
         auto content_length =
             get_header_value_int(req_->headers, CONTENT_LENGTH);
 
@@ -491,8 +683,6 @@ class HttpRequestReadListener : public Listener {
         if (!result.IsOK()) {
             return result;
         }
-        is_request_body_read_ = true;
-        log_->Debug("read body finish");
         return VoidResult::OK();
     }
 
@@ -503,19 +693,19 @@ class HttpRequestReadListener : public Listener {
             req_->body.assign(len, 0);
         }
         Result<ssize_t> rsize =
-            reader_.Read(&((req_->body)[body_progress]), len - body_progress);
+            reader_.Read(&((req_->body)[body_progress_]), len - body_progress_);
         if (!rsize.IsOK()) {
             if (rsize.IsError<FileAgain>()) {
-                body_progress += rsize.Get();
-                log_->Debug(string_format("progress: %d", body_progress));
+                body_progress_ += rsize.Get();
+                log_->Debug(string_format("progress: %d", body_progress_));
                 return VoidResult::ErrorResult<HttpReadAgain>(
                     "http read again!");
             }
             return rsize;
         } else {
-            body_progress += rsize.Get();
-            log_->Debug(string_format("progress: %d", body_progress));
-            if (body_progress != len) {
+            body_progress_ += rsize.Get();
+            log_->Debug(string_format("progress: %d", body_progress_));
+            if (body_progress_ != len) {
                 return VoidResult::ErrorResult<HttpReadAgain>(
                     "http read again!");
             }
@@ -523,23 +713,55 @@ class HttpRequestReadListener : public Listener {
         return VoidResult::OK();
     }
 
+    VoidResult read_len(char *buf, size_t len) {
+        Result<ssize_t> rsize = reader_.Read(buf, len - buf_progress_);
+        if (!rsize.IsOK()) {
+            if (rsize.IsError<FileAgain>()) {
+                buf_progress_ += rsize.Get();
+                buf_.append(buf);
+                log_->Debug(string_format("progress: %d", buf_progress_));
+                return VoidResult::ErrorResult<HttpReadAgain>(
+                    "http read again!");
+            }
+            return rsize;
+        }
+        if (rsize.Get() != len) {
+            if (buf_.size() != len) {
+                buf_.assign(len, 0);
+            }
+            buf_progress_ += rsize.Get();
+            log_->Debug(string_format("progress: %d", buf_progress_));
+            if (buf_progress_ != len) {
+                buf_.append(buf);
+                return VoidResult::ErrorResult<HttpReadAgain>(
+                    "http read again!");
+            }
+            memcpy(buf, buf_.data(), len);
+            buf_.clear();
+        }
+        return VoidResult::OK();
+    }
+
     VoidResult read_line(std::string &line) {
-        VoidResult result = reader_.ReadLine(buf_);
+        VoidResult result = reader_.ReadLine(line);
         if (!result.IsOK()) {
             if (result.IsError<FileAgain>()) {
+                buf_.append(line);
+                log_->Debug(buf_);
                 return VoidResult::ErrorResult<HttpReadAgain>(
                     "http read again!");
             };
             return result;
-        } else {
-            if (buf_.back() != '\n') {
-                return VoidResult::ErrorResult<HttpReadAgain>(
-                    "http read again!");
-            }
         }
 
-        line.assign(buf_);
-        log_->Debug(line);
+        if (line.back() != '\n') {
+            buf_.append(line);
+            log_->Debug(buf_);
+            return VoidResult::ErrorResult<HttpReadAgain>("http read again!");
+        }
+        if (!buf_.empty()) {
+            line.assign(buf_);
+        }
         buf_.clear();
         return VoidResult::OK();
     }
@@ -608,14 +830,30 @@ class HttpRequestReadListener : public Listener {
     FileReader reader_;
     Log *log_;
 
-    bool is_request_line_read_;
-    bool is_request_header_read_;
-    bool is_request_body_read_;
-    std::string buf_;
-    ssize_t body_progress;
+    enum class ParseStatus {
+        request_line,
+        request_headers,
+        post_query,
+        multipart_read_header,
+        multipart_read_file,
+        route,
+        finish
+    };
 
+    ParseStatus parse_status_;
+    std::string buf_;
+    ssize_t buf_progress_;
+    ssize_t body_progress_;
+
+    typedef struct MultipartFileInfo {
+        std::string name;
+        MultipartFile file;
+    } MultipartFileInfo;
+    MultipartFileInfo multipart_file_info_;
+    std::string multipart_data_buf_;
+    FileWriter multipart_file_writer_;
     bool connect_close_;
-};
+}; // namespace MyServer
 
 void HttpServerResponseListener::Callback(EventLoop *loop) {
     auto result = server_socket_->Accept();

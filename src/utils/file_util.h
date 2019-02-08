@@ -52,25 +52,36 @@ class Directory {};
 class File {
   public:
     File(const std::string &filename);
-    // File(FileDesc fileDesc);
+    File(FileDesc fileDesc);
     ~File();
-    VoidResult Create();
-    Result<bool> IsExist();
+    virtual VoidResult Create();
+    virtual Result<bool> IsExist();
+    virtual VoidResult Close();
+    VoidResult Seek(const off_t, int whence);
 
+    bool IsOpen();
     FileType GetFileType() const;
     std::string GetDir() const;
     std::string GetFileName() const;
+    FileDesc GetFileDesc() const;
 
-  private:
-    std::string dirname(const std::string &filename);
-    bool isOpen();
-
+  protected:
     FileDesc filedesc_;
     std::string filename_;
     std::string dirname_;
-    bool is_exist_;
+
+  private:
+    std::string dirname(const std::string &filename);
     FileType filetype_;
 };
+
+class MemFile : public File {
+  public:
+    MemFile(const std::string &filename);
+    VoidResult Create() override;
+    Result<bool> IsExist() override;
+};
+
 class Socket {
   public:
     Socket() = default;
@@ -89,6 +100,7 @@ class Socket {
 class FileWriter {
   public:
     // TODO: writer mode append / trunc, creat ...
+    FileWriter();
     FileWriter(const File &, bool append = false);
     FileWriter(const std::string &path, bool append = false);
     FileWriter(const FileDesc fileDesc);
@@ -131,7 +143,7 @@ class FileReader {
     // virtual Result Read(char *, const size_t size, const ssize_t offset,
     // ssize_t *rsize);
     virtual VoidResult ReadLine(std::string &);
-    // virtual Result Skip(const size_t offset);
+    VoidResult Skip(const size_t offset);
     VoidResult Close();
 
   private:
