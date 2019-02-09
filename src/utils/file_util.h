@@ -59,7 +59,7 @@ class File {
     virtual VoidResult Close();
     VoidResult Seek(const off_t, int whence);
 
-    bool IsOpen();
+    bool IsOpen() const;
     FileType GetFileType() const;
     std::string GetDir() const;
     std::string GetFileName() const;
@@ -108,7 +108,7 @@ class FileWriter {
     ~FileWriter();
 
     Result<FileDesc> getFd() const;
-    Result<bool> IsOpen() const;
+    VoidResult IsOpen() const;
     VoidResult Append(const std::string &data);
     VoidResult Write(const char *, size_t size);
     VoidResult Write(const char);
@@ -118,18 +118,20 @@ class FileWriter {
     VoidResult Sync();
 
   private:
+    void open(const std::string &path, bool append);
     VoidResult append(const char *, size_t size);
     VoidResult flushBuffer();
     VoidResult writeUnbufferd(const char *data, size_t size);
     FileDesc file_desc_;
     std::shared_ptr<char> buf_;
     size_t pos_;
-    Result<bool> is_open_;
+    VoidResult is_open_;
 };
 
 // based buffer
 class FileReader {
   public:
+    FileReader();
     FileReader(const File &file);
     FileReader(const std::string &path);
     FileReader(const FileDesc fileDesc);

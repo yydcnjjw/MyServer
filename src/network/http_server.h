@@ -35,13 +35,12 @@ class HttpMessage {
   public:
     std::string version;
     Headers headers;
-    Headers AddHeader();
-    Headers RemoveHeader();
 };
 
 class HttpResponse : public HttpMessage {
   public:
     int status;
+    std::string body;
 };
 
 class HttpRequest : public HttpMessage {

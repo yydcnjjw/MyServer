@@ -199,9 +199,7 @@ VoidResult File::Seek(const off_t offset, int whence) {
 
 std::string File::GetDir() const { return dirname_; }
 std::string File::GetFileName() const { return filename_; }
-FileDesc File::GetFileDesc() const {
-    return filedesc_;
-}
+FileDesc File::GetFileDesc() const { return filedesc_; }
 std::string File::dirname(const std::string &filename) {
     std::string::size_type pos = filename.rfind('/');
     if (pos == std::string::npos) {
@@ -210,7 +208,7 @@ std::string File::dirname(const std::string &filename) {
     return filename.substr(0, pos);
 }
 
-bool File::IsOpen() { return -1 != filedesc_; }
+bool File::IsOpen() const { return -1 != filedesc_; }
 
 MemFile::MemFile(const std::string &filename) : File(filename) {}
 
@@ -347,26 +345,27 @@ Result<Socket *> Socket::NewSocket(const std::string &host,
 
 FileWriter::FileWriter() : FileWriter(-1) {}
 
-FileWriter::FileWriter(const File &file, bool append)
-    : FileWriter(file.GetFileName(), append) {}
-
-FileWriter::FileWriter(const std::string &path, bool append)
-    : buf_(new char[FILE_BUFFER_SIZE]), pos_(0) {
-    if (append) {
-        file_desc_ = ::open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND,
-                            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+FileWriter::FileWriter(const File &file, bool append) : FileWriter() {
+    if (file.IsOpen()) {
+        file_desc_ = file.GetFileDesc();
+	is_open_ = VoidResult::OK();
     } else {
-        file_desc_ = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC,
-                            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        open(file.GetFileName(), append);
     }
-
-    if (-1 == file_desc_) {
-        is_open_ = FilePosixError(path.c_str());
-    }
-    is_open_ = true;
 }
+
+FileWriter::FileWriter(const std::string &path, bool append) : FileWriter() {
+    open(path, append);
+}
+
 FileWriter::FileWriter(const FileDesc fileDesc)
-    : file_desc_(fileDesc), buf_(new char[FILE_BUFFER_SIZE]), pos_(0) {}
+    : file_desc_(fileDesc), buf_(new char[FILE_BUFFER_SIZE]), pos_(0) {
+    if (fileDesc == -1) {
+        is_open_ = VoidResult::ErrorResult(new FileNotFound(""));
+    } else {
+	is_open_ = VoidResult::OK();
+    }
+}
 
 FileWriter::~FileWriter() { flushBuffer(); }
 
@@ -377,7 +376,9 @@ Result<FileDesc> FileWriter::getFd() const {
     return file_desc_;
 }
 
-Result<bool> FileWriter::IsOpen() const { return is_open_; }
+VoidResult FileWriter::IsOpen() const {
+    return is_open_;
+}
 
 VoidResult FileWriter::Append(const std::string &data) {
     return append(data.data(), data.size());
@@ -392,6 +393,21 @@ VoidResult FileWriter::Close() {
         return FilePosixError();
     }
     return VoidResult::OK();
+}
+
+void FileWriter::open(const std::string &path, bool append) {
+    if (append) {
+        file_desc_ = ::open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND,
+                            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    } else {
+        file_desc_ = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC,
+                            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    }
+
+    if (-1 == file_desc_) {
+        is_open_ = FilePosixError(path.c_str());
+    }
+    is_open_ = VoidResult::OK();
 }
 
 VoidResult FileWriter::append(const char *write_data, size_t write_size) {
@@ -462,7 +478,16 @@ VoidResult FileWriter::writeUnbufferd(const char *data, size_t size) {
     return VoidResult::OK();
 }
 
-FileReader::FileReader(const File &file) : FileReader(file.GetFileName()) {}
+FileReader::FileReader() : file_desc_(-1) {}
+
+FileReader::FileReader(const File &file) {
+    if (file.IsOpen()) {
+        FileReader(file.GetFileDesc());
+    } else {
+        FileReader(file.GetFileName());
+    }
+}
+
 FileReader::FileReader(const std::string &path)
     : readbuf_(new char[FILE_BUFFER_SIZE]), readcnt_(0),
       readptr_(readbuf_.get()) {

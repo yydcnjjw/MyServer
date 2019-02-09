@@ -257,12 +257,7 @@ class HttpRequestReadListener : public Listener {
                 break;
             }
             case ParseStatus::route: {
-                if (route_handle()) {
-                    res_->status = 200;
-                } else {
-                    res_->status = 404;
-                }
-                parse_status_ = ParseStatus::finish;
+                route_handle();
                 break;
             }
             default:
@@ -492,7 +487,7 @@ class HttpRequestReadListener : public Listener {
         }
 
         if (body_progress_ != content_length.Get()) {
-            if (read_size < 4 * 1024) {
+            if (read_size < MAX_MULTIPART_READ_SIZE) {
                 content.resize(read_size + offset);
                 result = read_len(&content[offset], read_size);
                 offset = 0;
@@ -501,6 +496,7 @@ class HttpRequestReadListener : public Listener {
                 result = read_len(&content[offset], read_size - offset);
             }
             if (!result.IsOK()) {
+                content.resize(offset);
                 return result;
             }
             body_progress_ += (read_size - offset);
@@ -539,7 +535,7 @@ class HttpRequestReadListener : public Listener {
                 }
             }
 
-            multipart_file_writer_ = FileWriter((*file)->GetFileDesc());
+            multipart_file_writer_ = FileWriter(**file);
         }
 
         result = multipart_file_writer_.Write(&content[0], pos);
@@ -580,39 +576,38 @@ class HttpRequestReadListener : public Listener {
     VoidResult read_content_without_length() { return VoidResult::OK(); }
 
     VoidResult read_len(char *buf, size_t len) {
-        Result<ssize_t> rsize = reader_.Read(buf, len - buf_progress_);
+        if (buf_.size() != len) {
+            buf_.assign(len, 0);
+        }
+        Result<ssize_t> rsize =
+            reader_.Read(&buf_[buf_progress_], len - buf_progress_);
         if (!rsize.IsOK()) {
             if (rsize.IsError<FileAgain>()) {
                 buf_progress_ += rsize.Get();
-                buf_.append(buf);
                 log_->Debug(string_format("progress: %d", buf_progress_));
                 return VoidResult::ErrorResult<HttpReadAgain>(
                     "http read again!");
             }
             return rsize;
         }
-        if (rsize.Get() != len) {
-            if (buf_.size() != len) {
-                buf_.assign(len, 0);
-            }
+        if (rsize.Get() != len - buf_progress_) {
             buf_progress_ += rsize.Get();
             log_->Debug(string_format("progress: %d", buf_progress_));
             if (buf_progress_ != len) {
-                buf_.append(buf);
                 return VoidResult::ErrorResult<HttpReadAgain>(
                     "http read again!");
             }
-            memcpy(buf, buf_.data(), len);
-            buf_.clear();
         }
+        memcpy(buf, buf_.data(), len);
+        buf_progress_ = 0;
+        buf_.clear();
         return VoidResult::OK();
     }
 
     VoidResult read_line(std::string &line) {
-        VoidResult result = reader_.ReadLine(line);
+        VoidResult result = reader_.ReadLine(buf_);
         if (!result.IsOK()) {
             if (result.IsError<FileAgain>()) {
-                buf_.append(line);
                 log_->Debug(buf_);
                 return VoidResult::ErrorResult<HttpReadAgain>(
                     "http read again!");
@@ -620,14 +615,11 @@ class HttpRequestReadListener : public Listener {
             return result;
         }
 
-        if (line.back() != '\n') {
-            buf_.append(line);
+        if (buf_.back() != '\n') {
             log_->Debug(buf_);
             return VoidResult::ErrorResult<HttpReadAgain>("http read again!");
         }
-        if (!buf_.empty()) {
-            line.assign(buf_);
-        }
+        line.assign(buf_);
         buf_.clear();
         return VoidResult::OK();
     }
@@ -659,11 +651,16 @@ class HttpRequestReadListener : public Listener {
         return result;
     }
 
-    bool route_handle() {
+    void route_handle() {
         if (handle_file_request()) {
-            return true;
+            return;
         }
-        return dispatch_request();
+        if (dispatch_request()) {
+            res_->status = 200;
+        } else {
+            res_->status = 404;
+        }
+        parse_status_ = ParseStatus::finish;
     }
 
     bool handle_file_request() {
@@ -745,6 +742,7 @@ void HttpServerResponseListener::Callback(EventLoop *loop) {
 }
 
 } // namespace
+
 Result<HttpServer *> HttpServer::NewHttpServer() {
 
     HttpServer *server = new HttpServerImpl;
