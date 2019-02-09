@@ -35,7 +35,6 @@ class HttpMessage {
   public:
     std::string version;
     Headers headers;
-    std::string body;
     Headers AddHeader();
     Headers RemoveHeader();
 };

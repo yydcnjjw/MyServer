@@ -360,11 +360,28 @@ class HttpRequestReadListener : public Listener {
     }
 
     VoidResult parse_post_query() {
-        VoidResult result = read_body();
+        VoidResult result;
+        auto content_length =
+            get_header_value_int(req_->headers, CONTENT_LENGTH);
+
         if (!result.IsOK()) {
             return result;
         }
-        parse_query_text(req_->body, req_->params);
+
+        std::string body;
+        body.assign(content_length.Get(), 0);
+        if (content_length.IsOK() && content_length.Get() > 0) {
+            result = read_len(&body[0], content_length.Get());
+        } else {
+            // TODO: chunked
+            result = read_content_without_length();
+        }
+        log_->Debug(result.str());
+
+        if (!result.IsOK()) {
+            return result;
+        }
+        parse_query_text(body, req_->params);
         parse_status_ = ParseStatus::route;
         return VoidResult::OK();
     }
@@ -561,157 +578,7 @@ class HttpRequestReadListener : public Listener {
         return VoidResult::OK();
     }
 
-    // Code modified from function parse_multipart_fromdata
-    // obtained from https://github.com/yhirose/cpp-httplib
-    VoidResult parse_multipart(const std::string &content_type) {
-        // parse boundary
-        auto boundary_pos = content_type.find("boundary=");
-        if (boundary_pos == std::string::npos) {
-            return VoidResult::ErrorResult<HttpError>("parse multipart error");
-        }
-
-        static std::string crlf = "\r\n";
-        static std::string dash = "--";
-        // parse multipart file data
-        static std::regex re_content_type("Content-Type: (.*?)",
-                                          std::regex_constants::icase);
-        static std::regex re_content_disposition(
-            "Content-Disposition: form-data; name=\"(.*?)\"(?:; "
-            "filename=\"(.*?)\")?",
-            std::regex_constants::icase);
-
-        std::string boundary = content_type.substr(boundary_pos + 9);
-        std::string dash_boundary = dash + boundary;
-
-        const std::string &body = req_->body;
-        size_t body_size = body.size();
-
-        auto pos = body.find(dash_boundary);
-        if (pos != 0) {
-            log_->Debug("parse error 1");
-            return VoidResult::ErrorResult<HttpError>("parse multipart error");
-        }
-
-        pos += dash_boundary.size();
-
-        auto next_pos = body.find(crlf, pos);
-        if (next_pos == std::string::npos) {
-            log_->Debug("parse error 2");
-            return VoidResult::ErrorResult<HttpError>("parse multipart error");
-        }
-
-        pos = next_pos + crlf.size();
-
-        while (pos < body.size()) {
-            next_pos = body.find(crlf, pos);
-            if (next_pos == std::string::npos) {
-                return VoidResult::ErrorResult<HttpError>(
-                    "parse multipart error");
-            }
-
-            std::string name;
-            MultipartFile file;
-
-            auto header = body.substr(pos, (next_pos - pos));
-
-            while (pos != next_pos) {
-                log_->Debug(header);
-                std::smatch m;
-                if (std::regex_match(header, m, re_content_type)) {
-                    // TODO: multipart/mixed support
-                    file.content_type = m[1];
-                } else if (std::regex_match(header, m,
-                                            re_content_disposition)) {
-                    name = m[1];
-                    file.filename = m[2];
-                }
-
-                pos = next_pos + crlf.size();
-
-                next_pos = body.find(crlf, pos);
-                if (next_pos == std::string::npos) {
-                    return VoidResult::ErrorResult<HttpError>(
-                        "parse multipart error");
-                }
-
-                header = body.substr(pos, (next_pos - pos));
-            }
-
-            pos = next_pos + crlf.size();
-
-            next_pos = body.find(crlf + dash_boundary, pos);
-
-            if (next_pos == std::string::npos) {
-                return VoidResult::ErrorResult<HttpError>(
-                    "parse multipart error");
-            }
-
-            file.offset = pos;
-            file.length = next_pos - pos;
-
-            pos = next_pos + crlf.size() + dash_boundary.size();
-
-            next_pos = body.find(crlf, pos);
-            if (next_pos == std::string::npos) {
-                return VoidResult::ErrorResult<HttpError>(
-                    "parse multipart error");
-            }
-
-            req_->files.emplace(name, file);
-            log_->Debug(string_format(
-                "id = %s, fileanme = %s, file length = %d", name.c_str(),
-                file.filename.c_str(), file.length));
-
-            pos = next_pos + crlf.size();
-        }
-        return VoidResult::OK();
-    }
-
-    VoidResult read_body() {
-        auto content_length =
-            get_header_value_int(req_->headers, CONTENT_LENGTH);
-
-        VoidResult result;
-        if (content_length.IsOK() && content_length.Get() > 0) {
-            result = read_content_with_length(content_length.Get());
-        } else {
-            // TODO: chunked
-            result = read_content_without_length();
-        }
-        log_->Debug(result.str());
-
-        if (!result.IsOK()) {
-            return result;
-        }
-        return VoidResult::OK();
-    }
-
     VoidResult read_content_without_length() { return VoidResult::OK(); }
-
-    VoidResult read_content_with_length(size_t len) {
-        if (req_->body.size() != len) {
-            req_->body.assign(len, 0);
-        }
-        Result<ssize_t> rsize =
-            reader_.Read(&((req_->body)[body_progress_]), len - body_progress_);
-        if (!rsize.IsOK()) {
-            if (rsize.IsError<FileAgain>()) {
-                body_progress_ += rsize.Get();
-                log_->Debug(string_format("progress: %d", body_progress_));
-                return VoidResult::ErrorResult<HttpReadAgain>(
-                    "http read again!");
-            }
-            return rsize;
-        } else {
-            body_progress_ += rsize.Get();
-            log_->Debug(string_format("progress: %d", body_progress_));
-            if (body_progress_ != len) {
-                return VoidResult::ErrorResult<HttpReadAgain>(
-                    "http read again!");
-            }
-        }
-        return VoidResult::OK();
-    }
 
     VoidResult read_len(char *buf, size_t len) {
         Result<ssize_t> rsize = reader_.Read(buf, len - buf_progress_);
@@ -844,6 +711,8 @@ class HttpRequestReadListener : public Listener {
     std::string buf_;
     ssize_t buf_progress_;
     ssize_t body_progress_;
+
+    std::string body_;
 
     typedef struct MultipartFileInfo {
         std::string name;
