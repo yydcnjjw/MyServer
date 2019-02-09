@@ -1,4 +1,3 @@
-
 #include "http_server.h"
 
 #include <unistd.h>
