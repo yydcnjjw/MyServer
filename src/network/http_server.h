@@ -26,7 +26,6 @@ typedef struct MultipartFile {
     std::string filename;
     std::string content_type;
     File *file = nullptr;
-    size_t offset = 0;
     size_t length = 0;
 } MultipartFile;
 typedef std::multimap<std::string, MultipartFile> MultipartFiles;
@@ -35,6 +34,7 @@ class HttpMessage {
   public:
     std::string version;
     Headers headers;
+    MultipartFiles files;
 };
 
 class HttpResponse : public HttpMessage {
@@ -49,7 +49,6 @@ class HttpRequest : public HttpMessage {
     std::string target;
     std::string path;
     Params params;
-    MultipartFiles files;
 };
 
 typedef std::function<void(const HttpRequest &, HttpResponse &)> HttpHandleFunc;
