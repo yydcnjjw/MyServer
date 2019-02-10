@@ -12,9 +12,7 @@
 
 namespace MyServer {
 namespace {
-
-const char *HTTP_V1_0 = "HTTP/1.0";
-const char *HTTP_V1_1 = "HTTP/1.1";
+const char *HTTP_V2 = "HTTP/2";
 enum HTTP_STATUS { OK = 0, CONNECT = 1 };
 
 const char *GET = "GET";
@@ -49,9 +47,8 @@ class HttpServerImpl : public HttpServer {
   public:
     // TODO: current dir use absolute
     HttpServerImpl()
-        : root_dir("."), method_handlers({{GET, {}}, {POST, {}}}),
-          server_socket_(nullptr), loop_(nullptr), server_iolistener_(nullptr),
-          isStart_(false) {}
+        : root_dir("."), server_socket_(nullptr), loop_(nullptr),
+          server_iolistener_(nullptr), isStart_(false) {}
     ~HttpServerImpl() override = default;
 
     HttpServer *Get(const std::string &re, HttpHandleFunc func) override {
@@ -231,7 +228,7 @@ class HttpRequestReadListener : public Listener {
     VoidResult handle_request(EventLoop *loop) {
         VoidResult result;
 
-        res_->version = HTTP_V1_1;
+        res_->version = HTTP_V2;
         res_->status = -1;
 
         while (parse_status_ != ParseStatus::finish) {
@@ -370,7 +367,6 @@ class HttpRequestReadListener : public Listener {
             // TODO: chunked
             result = read_content_without_length();
         }
-        log_->Debug(result.str());
 
         if (!result.IsOK()) {
             return result;
@@ -652,6 +648,8 @@ class HttpRequestReadListener : public Listener {
     }
 
     void route_handle() {
+        parse_status_ = ParseStatus::finish;
+
         if (handle_file_request()) {
             return;
         }
@@ -660,14 +658,12 @@ class HttpRequestReadListener : public Listener {
         } else {
             res_->status = 404;
         }
-        parse_status_ = ParseStatus::finish;
     }
 
     bool handle_file_request() {
         if (req_->method != GET) {
             return false;
         }
-
         return true;
     }
 

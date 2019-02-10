@@ -16,6 +16,9 @@ int main(int argc, char *argv[]) {
     server->Get("/", [](const HttpRequest &req, HttpResponse &res) {
         cout << "Hello World!" << endl;
     });
+    server->Post("/", [](const HttpRequest &req, HttpResponse &res) {
+        cout << "Hello World!" << endl;
+    });
 
     server->Listen("localhost", "8080");
     server->Start();
