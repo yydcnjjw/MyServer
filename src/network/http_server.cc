@@ -459,30 +459,38 @@ class HttpRequestReadListener : public Listener {
         }
         std::string boundary = boundary_result.Get();
 
-        auto content_length =
+        auto content_length_result =
             get_header_value_int(req_->headers, CONTENT_LENGTH);
-        if (!content_length.IsOK()) {
+        if (!content_length_result.IsOK()) {
             return VoidResult::ErrorResult<HttpError>("http format error");
         }
-
-        size_t rest_body_len = content_length.Get() - body_progress_;
-        size_t read_size = 0;
-        static const size_t MAX_MULTIPART_READ_SIZE = 4 * 1024;
-        if (MAX_MULTIPART_READ_SIZE > rest_body_len) {
-            read_size = rest_body_len;
-        } else if (MAX_MULTIPART_READ_SIZE < rest_body_len) {
-            read_size = MAX_MULTIPART_READ_SIZE;
-        }
+        auto content_length = content_length_result.Get();
 
         std::string dash_boundary = dash + boundary;
         size_t dash_boundary_size = dash_boundary.size();
         std::string &content = multipart_data_buf_;
-        size_t offset = content.size();
-        if (offset == 0) {
-            content.assign(read_size, 0);
-        }
 
-        if (body_progress_ != content_length.Get()) {
+        static const size_t MAX_MULTIPART_READ_SIZE = 4 * 1024;
+        size_t rest_body_len = 0;
+        size_t read_size = 0;
+        size_t offset = 0;
+
+        MultipartFileInfo &fileinfo = multipart_file_info_;
+	File **file = &fileinfo.file.file;
+        bool is_read_finish = false;
+
+        while (body_progress_ != content_length) {
+            rest_body_len = content_length - body_progress_;
+            if (MAX_MULTIPART_READ_SIZE > rest_body_len) {
+                read_size = rest_body_len;
+            } else if (MAX_MULTIPART_READ_SIZE < rest_body_len) {
+                read_size = MAX_MULTIPART_READ_SIZE;
+            }
+
+            offset = content.size();
+            if (offset == 0) {
+                content.assign(read_size, 0);
+            }
             if (read_size < MAX_MULTIPART_READ_SIZE) {
                 content.resize(read_size + offset);
                 result = read_len(&content[offset], read_size);
@@ -496,74 +504,72 @@ class HttpRequestReadListener : public Listener {
                 return result;
             }
             body_progress_ += (read_size - offset);
-        }
 
-        auto pos = content.find(crlf + dash_boundary);
+            auto pos = content.find(crlf + dash_boundary);
 
-        bool is_read_finish = false;
-        if (pos == std::string::npos) {
-            pos = read_size - dash_boundary_size - crlf_size;
-        } else {
-            is_read_finish = true;
-        }
-
-        MultipartFileInfo &fileinfo = multipart_file_info_;
-        File **file = &fileinfo.file.file;
-        std::string filename = string_format("tmp_%s_%s", fileinfo.name.c_str(),
-                                             fileinfo.file.filename.c_str());
-        if (*file == nullptr) {
-
-            if (pos <
-                MAX_MULTIPART_READ_SIZE - dash_boundary_size - crlf_size) {
-                *file = new MemFile(filename);
+            if (pos == std::string::npos) {
+                is_read_finish = false;
+                pos = read_size - dash_boundary_size - crlf_size;
             } else {
-                *file = new File(filename);
+                is_read_finish = true;
             }
 
-            if (!file) {
-                return VoidResult::ErrorResult<OutOfMemory>("allocate File");
-            }
-
-            if (!(*file)->IsOpen()) {
-                result = (*file)->Create();
-                if (!result.IsOK()) {
-                    return result;
+            if (*file == nullptr) {
+                std::string filename =
+                    string_format("tmp_%s_%s", fileinfo.name.c_str(),
+                                  fileinfo.file.filename.c_str());
+                if (pos < MAX_MULTIPART_READ_SIZE - dash_boundary_size - crlf_size) {
+                    *file = new MemFile(filename);
+                } else {
+                    *file = new File(filename);
                 }
+
+                if (!*file) {
+                    return VoidResult::ErrorResult<OutOfMemory>(
+                        "allocate File");
+                }
+
+                if (!(*file)->IsOpen()) {
+                    result = (*file)->Create();
+                    if (!result.IsOK()) {
+                        return result;
+                    }
+                }
+
+                multipart_file_writer_ = FileWriter(**file);
             }
 
-            multipart_file_writer_ = FileWriter(**file);
-        }
-
-        result = multipart_file_writer_.Write(&content[0], pos);
-        if (!result.IsOK()) {
-            return result;
-        }
-
-        fileinfo.file.length += pos;
-
-        if (is_read_finish) {
-            std::string boundary_rear =
-                content.substr(pos + crlf_size + dash_boundary_size, 2);
-            if (!boundary_rear.compare("\r\n")) {
-                content.erase(0, pos + crlf_size * 2 + dash_boundary_size);
-                parse_status_ = ParseStatus::multipart_read_header;
-            } else if (!boundary_rear.compare("--")) {
-                parse_status_ = ParseStatus::route;
-                content.clear();
-            }
-            req_->files.emplace(fileinfo.name, fileinfo.file);
-            log_->Debug(string_format("filename=%s,filesize=%d",
-                                      fileinfo.file.filename.c_str(),
-                                      fileinfo.file.length));
-            fileinfo.file.file = nullptr;
-            fileinfo.file.length = 0;
-            result = multipart_file_writer_.Flush();
+            result = multipart_file_writer_.Write(&content[0], pos);
             if (!result.IsOK()) {
                 return result;
             }
 
-        } else {
-            content.erase(0, pos);
+            fileinfo.file.length += pos;
+
+            if (is_read_finish) {
+                std::string boundary_rear =
+                    content.substr(pos + crlf_size + dash_boundary_size, 2);
+                if (!boundary_rear.compare("\r\n")) {
+                    content.erase(0, pos + crlf_size * 2 + dash_boundary_size);
+                    parse_status_ = ParseStatus::multipart_read_header;
+                } else if (!boundary_rear.compare("--")) {
+                    parse_status_ = ParseStatus::route;
+                    content.clear();
+                }
+                req_->files.emplace(fileinfo.name, fileinfo.file);
+                log_->Debug(string_format("filename=%s,filesize=%d",
+                                          fileinfo.file.filename.c_str(),
+                                          fileinfo.file.length));
+                fileinfo.file.file = nullptr;
+                fileinfo.file.length = 0;
+                result = multipart_file_writer_.Flush();
+                if (!result.IsOK()) {
+                    return result;
+                }
+                break;
+            } else {
+                content.erase(0, pos);
+            }
         }
 
         return VoidResult::OK();
