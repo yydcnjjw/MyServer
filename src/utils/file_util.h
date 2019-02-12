@@ -3,10 +3,12 @@
 
 #include <sys/socket.h>
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "common/singleton.h"
 #include "error_util.h"
 
 namespace Utils {
@@ -47,15 +49,14 @@ enum class FileType {
 
 };
 
-class Directory {};
-
 class File {
   public:
     File(const std::string &filename);
     File(FileDesc fileDesc);
     ~File();
     virtual VoidResult Create();
-    virtual Result<bool> IsExist();
+    static bool IsExist(const std::string &filename);
+    virtual bool IsExist();
     virtual VoidResult Close();
     VoidResult Seek(const off_t, int whence);
 
@@ -63,6 +64,9 @@ class File {
     FileType GetFileType() const;
     std::string GetDir() const;
     std::string GetFileName() const;
+    static Result<size_t> GetFileSize(const std::string &filename);
+    Result<size_t> GetFileSize() const;
+
     FileDesc GetFileDesc() const;
 
   protected:
@@ -79,7 +83,10 @@ class MemFile : public File {
   public:
     MemFile(const std::string &filename);
     VoidResult Create() override;
-    Result<bool> IsExist() override;
+    bool IsExist() override;
+
+  private:
+    static bool IsExist(const std::string &filename);
 };
 
 class Socket {
@@ -109,9 +116,9 @@ class FileWriter {
 
     Result<FileDesc> getFd() const;
     VoidResult IsOpen() const;
-    VoidResult Append(const std::string &data);
-    VoidResult Write(const char *, size_t size);
-    VoidResult Write(const char);
+    Result<ssize_t> Append(const std::string &data);
+    Result<ssize_t> Write(const char *, size_t size);
+    Result<ssize_t> Write(const char);
     VoidResult Close();
 
     VoidResult Flush();
@@ -119,12 +126,13 @@ class FileWriter {
 
   private:
     void open(const std::string &path, bool append);
-    VoidResult append(const char *, size_t size);
+    Result<ssize_t> append(const char *, size_t size);
     VoidResult flushBuffer();
-    VoidResult writeUnbufferd(const char *data, size_t size);
+    Result<ssize_t> writeUnbufferd(const char *data, size_t size);
     FileDesc file_desc_;
     std::shared_ptr<char> buf_;
     size_t pos_;
+    size_t rear_pos_;
     VoidResult is_open_;
 };
 
@@ -149,12 +157,13 @@ class FileReader {
     VoidResult Close();
 
   private:
+    void open(const std::string &path);
     Result<ssize_t> read(char *, size_t size);
     FileDesc file_desc_;
     std::shared_ptr<char> readbuf_;
     ssize_t readcnt_;
     char *readptr_;
-    Result<bool> is_open_;
+    VoidResult is_open_;
 };
 
 class MMapFileReader : public FileReader {
@@ -194,6 +203,40 @@ class IOPoll {
     virtual VoidResult Delete(FdWatcher &) = 0;
     virtual VoidResult Poll(std::vector<PollEvent> &, int timeout) = 0;
 };
+
+typedef struct FileCacheOption {
+    size_t max_file_size = 2 * 1024 * 1024;           // 2MB
+    size_t file_cache_apability = 1024 * 1024 * 1024; // 1G
+} FileCacheOption;
+struct FileCacheEntity {
+    char *data = nullptr;
+    size_t size = 0;
+    FileDesc fd = -1;
+};
+
+class FileCacheCapabilityError : public Error {
+  public:
+    FileCacheCapabilityError() : Error("File Cache Capability Error") {}
+};
+
+typedef std::map<std::string, FileCacheEntity> FileMap;
+class FileCache {
+  public:
+    FileCache() : option_(FileCacheOption()), cached_size_(0) {}
+    Result<FileCacheEntity> FileGet(const std::string &key);
+    size_t CacheTotal() const;
+
+    void SetOption(const FileCacheOption &option) { option_ = option; };
+
+  private:
+    FileMap filemap_;
+    FileReader reader_;
+
+    FileCacheOption option_;
+    size_t cached_size_;
+};
+
+FileCache *GetFileCache();
 } // namespace Utils
 
 #endif /* FILE_UTIL_H */

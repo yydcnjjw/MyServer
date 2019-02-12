@@ -20,17 +20,17 @@ class Error {
     std::string error_;
 };
 
-enum class Status { SUCCESS, FAILURE };
-
 class VoidResult {
   public:
     VoidResult() : status_(Status::SUCCESS), error_(new Error) {}
 
     static VoidResult OK() { return VoidResult(); }
 
-    template <typename ErrorType>
-    static VoidResult ErrorResult(const std::string &msg = "") {
-        return VoidResult(msg, new ErrorType);
+    template <typename ErrorType, typename... ConstructorArgTypes>
+    static VoidResult ErrorResult(const std::string &msg = "",
+                                  ConstructorArgTypes &&... constructor_args) {
+        return VoidResult(msg, new ErrorType(std::forward<ConstructorArgTypes>(
+                                   constructor_args)...));
     }
 
     static VoidResult ErrorResult(Error *error, const std::string &msg = "") {
@@ -48,9 +48,11 @@ class VoidResult {
   private:
     VoidResult(const std::string &msg, Error *e)
         : status_(Status::FAILURE), error_(e), msg_(msg) {}
+    
+    enum class Status { SUCCESS, FAILURE };
+    Status status_;
 
     std::shared_ptr<Error> error_;
-    Status status_;
     std::string msg_;
 };
 

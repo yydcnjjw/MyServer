@@ -11,25 +11,25 @@ int main(int argc, char *argv[]) {
 }
 
 TEST(ErrorTest, error) {
+    Utils::VoidResult result =
+        Utils::VoidResult::ErrorResult<Utils::SysError>("syserror", 10);
+    cout << result.str() << endl;
     Utils::Result<ssize_t> r(
         1, Utils::VoidResult::ErrorResult<Utils::NotSupport>());
-    EXPECT_TRUE(r.Get() == 1);
+    r.Get() += 1;
+    cout << r.Get() << endl;
+    EXPECT_TRUE(r.Get() == 2);
 }
 
 bool MemFileTest() {
     Utils::VoidResult result;
     Utils::File *file = new Utils::MemFile("test");
-
-    result = file->IsExist();
-    if (!result.IsOK()) {
-        cout << result.str() << endl;
-        return false;
-    }
-
-    result = file->Create();
-    if (!result.IsOK()) {
-        cout << result.str() << endl;
-        return false;
+    if (!file->IsExist()) {
+        result = file->Create();
+        if (!result.IsOK()) {
+            cout << result.str() << endl;
+            return false;
+        }
     }
 
     Utils::FileWriter fw(file->GetFileDesc());
@@ -62,3 +62,36 @@ bool MemFileTest() {
 }
 
 TEST(FileApiTest, MemFileTest) { EXPECT_TRUE(MemFileTest()); }
+
+bool FileCacheTest() {
+    Utils::FileCache *filecache = Utils::GetFileCache();
+    auto result = filecache->FileGet("test.file");
+    if (!result.IsOK()) {
+	cout << result.str() << endl;
+	return false;
+    }
+
+    Utils::FileCacheEntity& entity = result.Get();
+    std::string s;
+    
+    cout << entity.fd << endl;
+    cout << entity.size << endl;
+    s.append(entity.data, entity.size);
+    cout << s << endl;
+
+    result = filecache->FileGet("test.file");
+    if (!result.IsOK()) {
+	cout << result.str() << endl;
+	return false;
+    }
+
+    entity = result.Get();
+    cout << entity.fd << endl;
+    cout << entity.size << endl;
+    s.append(entity.data, entity.size);
+    cout << s << endl;
+    
+    return true;
+}
+
+TEST(FileApiTest, FileCacheTest) { EXPECT_TRUE(FileCacheTest()); }

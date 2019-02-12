@@ -41,6 +41,7 @@ class HttpResponse : public HttpMessage {
   public:
     int status;
     std::string body;
+    std::string *GetResponseHeader();
 };
 
 class HttpRequest : public HttpMessage {
@@ -58,23 +59,26 @@ struct HttpHandler {
     HttpHandleFunc func;
 };
 
+struct HttpServerOption {
+    std::string root_dir;
+    std::string host;
+    std::string port; // server
+};
+
 class HttpServer : public Server {
   public:
     HttpServer() = default;
     virtual ~HttpServer() override = default;
 
-    static Result<HttpServer *> NewHttpServer();
+    static Result<HttpServer *> NewHttpServer(const HttpServerOption &option);
 
     virtual HttpServer *Get(const std::string &, HttpHandleFunc) = 0;
     virtual HttpServer *Post(const std::string &, HttpHandleFunc) = 0;
-
-    virtual VoidResult setRootDir(const std::string &path) = 0;
-    virtual VoidResult Listen(const std::string &host,
-                              const std::string &port) = 0;
-
+    
     virtual VoidResult Start() override = 0;
     virtual VoidResult Stop() override = 0;
     virtual VoidResult Restart() override = 0;
+    
     virtual VoidResult addToEventLoop(EventLoop *) override = 0;
 };
 

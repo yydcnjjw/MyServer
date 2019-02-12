@@ -30,11 +30,11 @@ constexpr const char *LISTENQ_ENV = "LISTENQ";
 VoidResult FilePosixError(const std::string &filename = "",
                           const std::string &msg = "") {
     if (errno == ENONET) {
-        return VoidResult::ErrorResult(new FileNotFound(filename), msg);
+        return VoidResult::ErrorResult<FileNotFound>(msg, filename);
     } else if (errno == EAGAIN) {
-        return VoidResult::ErrorResult(new FileAgain(filename), msg);
+        return VoidResult::ErrorResult<FileAgain>(msg, filename);
     }
-    return VoidResult::ErrorResult(new SysError(errno), msg);
+    return VoidResult::ErrorResult<SysError>(msg, errno);
 }
 
 VoidResult SocketPosixError(const std::string &msg = "") {
@@ -90,8 +90,6 @@ class EPollIOPoll final : public IOPoll {
         PollEvent event;
         for (int i = 0; i < nr_events; i++) {
             uint32_t flag = events[i].events;
-            // printf("fd = %d, flag = %x\n", events[i].data.fd,
-            // events[i].events);
             event.event = 0;
             if (flag & (EPOLLIN | EPOLLRDNORM)) {
                 event.event |= IOEvent::READ;
@@ -175,14 +173,18 @@ VoidResult File::Create() {
     return VoidResult::OK();
 }
 
-Result<bool> File::IsExist() {
+bool File::IsExist(const std::string &filename) {
+    if (-1 == ::access(filename.c_str(), F_OK)) {
+        return false;
+    }
+    return true;
+}
+
+bool File::IsExist() {
     if (IsOpen()) {
         return true;
     }
-    if (-1 == ::access(filename_.c_str(), F_OK)) {
-        return FilePosixError(filename_);
-    }
-    return true;
+    return IsExist(filename_);
 }
 
 VoidResult File::Seek(const off_t offset, int whence) {
@@ -199,6 +201,16 @@ VoidResult File::Seek(const off_t offset, int whence) {
 
 std::string File::GetDir() const { return dirname_; }
 std::string File::GetFileName() const { return filename_; }
+Result<size_t> File::GetFileSize() const { return GetFileSize(filename_); }
+
+Result<size_t> File::GetFileSize(const std::string &filename) {
+    struct stat stat;
+    if (-1 == ::stat(filename.c_str(), &stat)) {
+        return FilePosixError(filename);
+    }
+    return stat.st_size;
+}
+
 FileDesc File::GetFileDesc() const { return filedesc_; }
 std::string File::dirname(const std::string &filename) {
     std::string::size_type pos = filename.rfind('/');
@@ -223,7 +235,7 @@ VoidResult MemFile::Create() {
     return VoidResult::OK();
 }
 
-Result<bool> MemFile::IsExist() { return File::IsOpen(); }
+bool MemFile::IsExist() { return File::IsOpen(); }
 
 class PosixSocket : public Socket {
   public:
@@ -348,7 +360,7 @@ FileWriter::FileWriter() : FileWriter(-1) {}
 FileWriter::FileWriter(const File &file, bool append) : FileWriter() {
     if (file.IsOpen()) {
         file_desc_ = file.GetFileDesc();
-	is_open_ = VoidResult::OK();
+        is_open_ = VoidResult::OK();
     } else {
         open(file.GetFileName(), append);
     }
@@ -359,11 +371,12 @@ FileWriter::FileWriter(const std::string &path, bool append) : FileWriter() {
 }
 
 FileWriter::FileWriter(const FileDesc fileDesc)
-    : file_desc_(fileDesc), buf_(new char[FILE_BUFFER_SIZE]), pos_(0) {
+    : file_desc_(fileDesc), buf_(new char[FILE_BUFFER_SIZE]), pos_(0),
+      rear_pos_(0) {
     if (fileDesc == -1) {
         is_open_ = VoidResult::ErrorResult(new FileNotFound(""));
     } else {
-	is_open_ = VoidResult::OK();
+        is_open_ = VoidResult::OK();
     }
 }
 
@@ -376,18 +389,16 @@ Result<FileDesc> FileWriter::getFd() const {
     return file_desc_;
 }
 
-VoidResult FileWriter::IsOpen() const {
-    return is_open_;
-}
+VoidResult FileWriter::IsOpen() const { return is_open_; }
 
-VoidResult FileWriter::Append(const std::string &data) {
+Result<ssize_t> FileWriter::Append(const std::string &data) {
     return append(data.data(), data.size());
 }
 
-VoidResult FileWriter::Write(const char *buf, size_t size) {
+Result<ssize_t> FileWriter::Write(const char *buf, size_t size) {
     return append(buf, size);
 }
-VoidResult FileWriter::Write(const char ch) { return append(&ch, 1); }
+Result<ssize_t> FileWriter::Write(const char ch) { return append(&ch, 1); }
 VoidResult FileWriter::Close() {
     if (::close(file_desc_) == -1) {
         return FilePosixError();
@@ -410,7 +421,7 @@ void FileWriter::open(const std::string &path, bool append) {
     is_open_ = VoidResult::OK();
 }
 
-VoidResult FileWriter::append(const char *write_data, size_t write_size) {
+Result<ssize_t> FileWriter::append(const char *write_data, size_t write_size) {
     if (!IsOpen().IsOK()) {
         return is_open_;
     }
@@ -422,21 +433,28 @@ VoidResult FileWriter::append(const char *write_data, size_t write_size) {
     pos_ += copy_size;
 
     if (write_size == 0) {
-        return VoidResult::OK();
+        return Result<ssize_t>(copy_size, VoidResult::OK());
     }
 
-    VoidResult result = flushBuffer();
+    auto result = flushBuffer();
     if (!result.IsOK()) {
-        return result;
+        return Result<ssize_t>(copy_size, result);
     }
 
     if (write_size < FILE_BUFFER_SIZE) {
         std::memcpy(buf_.get(), write_data, write_size);
         pos_ = write_size;
-        return VoidResult::OK();
+        return Result<ssize_t>(copy_size + write_size, VoidResult::OK());
     }
 
-    return writeUnbufferd(write_data, write_size);
+    Result<ssize_t> write_len = writeUnbufferd(write_data, write_size);
+    if (!write_len.IsOK()) {
+        if (write_len.IsError<FileAgain>()) {
+            write_len.Get() += copy_size;
+        }
+        return write_len;
+    }
+    return VoidResult::OK();
 }
 
 VoidResult FileWriter::Flush() {
@@ -445,65 +463,81 @@ VoidResult FileWriter::Flush() {
     }
     return flushBuffer();
 }
-
 VoidResult FileWriter::Sync() {
     if (!IsOpen().IsOK()) {
         return is_open_;
     }
 
-    VoidResult r = flushBuffer();
+    auto r = flushBuffer();
     if (r.IsOK() && ::fsync(file_desc_) != 0) {
-        r = FilePosixError("");
+        r = FilePosixError();
     }
     return r;
 }
 
 VoidResult FileWriter::flushBuffer() {
-    VoidResult r = writeUnbufferd(buf_.get(), pos_);
+    Result<ssize_t> result;
+    result = writeUnbufferd(buf_.get() + rear_pos_, pos_ - rear_pos_);
+    if (!result.IsOK()) {
+        if (result.IsError<FileAgain>()) {
+            rear_pos_ += result.Get();
+        }
+        return result;
+    }
     pos_ = 0;
-    return r;
+    rear_pos_ = 0;
+    return VoidResult::OK();
 }
 
-VoidResult FileWriter::writeUnbufferd(const char *data, size_t size) {
+Result<ssize_t> FileWriter::writeUnbufferd(const char *data, size_t size) {
+    ssize_t write_len = 0;
     while (size > 0) {
         ssize_t write_result = ::write(file_desc_, data, size);
         if (write_result < 0) {
             if (errno == EINTR)
                 continue;
-            return FilePosixError();
+            return Result<ssize_t>(write_len, FilePosixError());
         }
+        write_len += write_result;
         data += write_result;
         size -= write_result;
     }
     return VoidResult::OK();
 }
 
-FileReader::FileReader() : file_desc_(-1) {}
+FileReader::FileReader() : FileReader(-1) {}
 
-FileReader::FileReader(const File &file) {
+FileReader::FileReader(const File &file) : FileReader() {
     if (file.IsOpen()) {
-        FileReader(file.GetFileDesc());
+        file_desc_ = file.GetFileDesc();
+        is_open_ = VoidResult::OK();
     } else {
-        FileReader(file.GetFileName());
+        open(file.GetFileName());
     }
 }
 
-FileReader::FileReader(const std::string &path)
-    : readbuf_(new char[FILE_BUFFER_SIZE]), readcnt_(0),
+FileReader::FileReader(const std::string &path) : FileReader() { open(path); }
+FileReader::FileReader(const FileDesc fileDesc)
+    : file_desc_(fileDesc), readbuf_(new char[FILE_BUFFER_SIZE]), readcnt_(0),
       readptr_(readbuf_.get()) {
+    if (fileDesc == -1) {
+        is_open_ = VoidResult::ErrorResult(new FileNotFound(""));
+    } else {
+        is_open_ = VoidResult::OK();
+    }
+}
+
+FileReader::~FileReader() {}
+
+void FileReader::open(const std::string &path) {
     file_desc_ = ::open(path.c_str(), O_CREAT | O_RDONLY,
                         S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
     if (-1 == file_desc_) {
         is_open_ = FilePosixError(path.c_str());
     }
-    is_open_ = true;
+    is_open_ = VoidResult::OK();
 }
-FileReader::FileReader(const FileDesc fileDesc)
-    : file_desc_(fileDesc), readbuf_(new char[FILE_BUFFER_SIZE]), readcnt_(0),
-      readptr_(readbuf_.get()), is_open_(true) {}
-
-FileReader::~FileReader() {}
 
 Result<FileDesc> FileReader::getFd() const {
     if (!IsOpen().IsOK()) {
@@ -617,6 +651,50 @@ Result<IOPoll *> IOPoll::newIOPoll(IOPollBackend backend) {
             "IOPoll is not support this backend");
     }
     return poll;
+}
+
+Result<FileCacheEntity> FileCache::FileGet(const std::string &key) {
+    auto it = filemap_.find(key);
+    if (it != filemap_.end()) {
+        return it->second;
+    }
+
+    Result<size_t> file_size = File::GetFileSize(key);
+    if (!file_size.IsOK()) {
+        return FilePosixError(key);
+    }
+ 
+    if (file_size.Get() > option_.max_file_size ||
+        CacheTotal() + file_size.Get() > option_.file_cache_apability) {
+        return VoidResult::ErrorResult<FileCacheCapabilityError>();
+    }
+
+    int fd = ::open(key.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return FilePosixError(key);
+    }
+
+    void *mmap_base =
+        ::mmap(/*addr=*/nullptr, file_size.Get(), PROT_READ, MAP_SHARED, fd, 0);
+    if (mmap_base == MAP_FAILED) {
+        return Result<char *>(nullptr, FilePosixError(key));
+    }
+
+    cached_size_ += file_size.Get();
+
+    FileCacheEntity entity;
+    entity.data = static_cast<char *>(mmap_base);
+    entity.size = file_size.Get();
+    entity.fd = fd;
+    filemap_.emplace(key, entity);
+    return entity;
+}
+
+size_t FileCache::CacheTotal() const { return cached_size_; }
+
+FileCache* GetFileCache() {
+    static Singleton<FileCache> singletion;
+    return singletion.get();
 }
 
 std::string FileError::format() {

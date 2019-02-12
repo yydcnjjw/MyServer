@@ -11,7 +11,10 @@ namespace {
 class EventLoopImpl : public EventLoop {
   public:
     EventLoopImpl(const LogOption &option) : logger_(new Log(option)) {}
-    ~EventLoopImpl() override = default;
+    ~EventLoopImpl() override {
+        delete iopoll_;
+        delete logger_;
+    };
     VoidResult Init() {
         auto result = IOPoll::newIOPoll(IOPollBackend::EPOLL);
         if (!result.IsOK()) {
@@ -113,7 +116,7 @@ class EventLoopImpl : public EventLoop {
             ioEvents_[fd].read = nullptr;
         } else if (event == IOEvent::WRITE) {
             ioEvents_[fd].write = nullptr;
-        }        
+        }
         return VoidResult::OK();
     }
 

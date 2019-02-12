@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <filesystem>
 #include <regex>
 
 #include "core/event_listener.h"
@@ -12,7 +13,10 @@
 
 namespace MyServer {
 namespace {
-const char *HTTP_V2 = "HTTP/2";
+
+namespace fs = std::filesystem;
+
+const char *HTTP_V1_1 = "HTTP/1.1";
 enum HTTP_STATUS { OK = 0, CONNECT = 1 };
 
 const char *GET = "GET";
@@ -24,9 +28,9 @@ const char *CONTENT_LENGTH = "Content-Length";
 const char *CONTENT_TYPE = "Content-Type";
 
 typedef std::vector<HttpHandler> HttpHandlers;
-class HttpReadAgain : public HttpError {
+class HttpAgain : public HttpError {
   public:
-    HttpReadAgain() {}
+    HttpAgain() {}
 };
 class HttpServerImpl;
 
@@ -35,7 +39,9 @@ class HttpServerResponseListener : public Listener {
     HttpServerResponseListener(Socket *serverSocket, HttpServerImpl *server)
         : server_socket_(serverSocket), server_(server) {}
 
-    ~HttpServerResponseListener() override = default;
+    ~HttpServerResponseListener() override{
+
+    };
     void Callback(EventLoop *loop) override;
 
   private:
@@ -46,10 +52,30 @@ class HttpServerResponseListener : public Listener {
 class HttpServerImpl : public HttpServer {
   public:
     // TODO: current dir use absolute
-    HttpServerImpl()
-        : root_dir("."), server_socket_(nullptr), loop_(nullptr),
+    HttpServerImpl(const HttpServerOption &option)
+        : option(option), server_socket_(nullptr), loop_(nullptr),
           server_iolistener_(nullptr), isStart_(false) {}
-    ~HttpServerImpl() override = default;
+    ~HttpServerImpl() override {
+        if (server_socket_ != nullptr) {
+            delete server_socket_;
+        }
+        if (loop_ != nullptr) {
+            delete loop_;
+        }
+    };
+
+    VoidResult ApplyOption() {
+        VoidResult result = listen_socket(option.host, option.port);
+        if (!result.IsOK()) {
+            return result;
+        }
+
+        result = check_root_dir();
+        if (!result.IsOK()) {
+            return result;
+        }
+        return VoidResult::OK();
+    }
 
     HttpServer *Get(const std::string &re, HttpHandleFunc func) override {
         method_handlers[GET].push_back({std::regex(re), func});
@@ -58,29 +84,6 @@ class HttpServerImpl : public HttpServer {
     HttpServer *Post(const std::string &re, HttpHandleFunc func) override {
         method_handlers[POST].push_back({std::regex(re), func});
         return this;
-    }
-
-    VoidResult setRootDir(const std::string &path) override {
-        // TODO: is valid root dir
-        root_dir = path;
-        return VoidResult::OK();
-    }
-
-    VoidResult Listen(const std::string &host,
-                      const std::string &port) override {
-
-        auto result = Socket::NewSocket(host, port);
-        if (!result.IsOK()) {
-            return result;
-        }
-        server_socket_ = result.Get();
-
-        server_socket_->setNonBlocking();
-        result = server_socket_->Bind();
-        if (!result.IsOK()) {
-            return result;
-        }
-        return server_socket_->Listen();
     }
 
     VoidResult Start() override {
@@ -104,10 +107,10 @@ class HttpServerImpl : public HttpServer {
         if (!result.IsOK()) {
             return result;
         }
-
         loop_->Run();
         return VoidResult::OK();
     }
+
     VoidResult Stop() override {
         VoidResult s;
         if (!isStart_) {
@@ -120,9 +123,6 @@ class HttpServerImpl : public HttpServer {
     VoidResult Restart() override { return VoidResult::OK(); }
 
     VoidResult addToEventLoop(EventLoop *loop) override {
-        if (server_socket_ == nullptr) {
-            return VoidResult::ErrorResult<HttpError>("Not bind host and port");
-        }
         if (server_iolistener_ == nullptr) {
             server_iolistener_ =
                 new HttpServerResponseListener(server_socket_, this);
@@ -134,12 +134,40 @@ class HttpServerImpl : public HttpServer {
         return loop->AddListener(server_socket_->GetFd(), IOEvent::READ,
                                  server_iolistener_);
     }
-
-  public:
-    std::string root_dir;
+    HttpServerOption option;
     std::map<std::string, HttpHandlers> method_handlers;
 
   private:
+    VoidResult listen_socket(const std::string &host, const std::string &port) {
+        auto result = Socket::NewSocket(host, port);
+        if (!result.IsOK()) {
+            return result;
+        }
+        server_socket_ = result.Get();
+
+        server_socket_->setNonBlocking();
+        result = server_socket_->Bind();
+        if (!result.IsOK()) {
+            return result;
+        }
+        return server_socket_->Listen();
+    }
+
+    VoidResult check_root_dir() {
+        std::string &root_dir = option.root_dir;
+        try {
+            const fs::path path = fs::absolute(root_dir);
+            root_dir.assign(path);
+            if (!fs::exists(path) || !fs::is_directory(path)) {
+                return VoidResult::ErrorResult<HttpError>(
+                    "root dir is invalid!");
+            }
+        } catch (fs::filesystem_error &e) {
+            return VoidResult::ErrorResult<HttpError>(e.what());
+        }
+        return VoidResult::OK();
+    }
+
     Socket *server_socket_;
     EventLoop *loop_;
 
@@ -149,12 +177,17 @@ class HttpServerImpl : public HttpServer {
     bool isStart_;
 };
 
+// TODO: file cache system
+size_t MAX_FILE_READ_SIZE = 4 * 1024;
 class HttpRequestWriteListener : public Listener {
   public:
     HttpRequestWriteListener(Socket *connectSocket, HttpServerImpl *server,
                              HttpRequest *req, HttpResponse *res)
         : server_(server), connect_socket_(connectSocket), req_(req), res_(res),
-          file_writer_(FileWriter(connectSocket->GetFd())) {}
+          data_ptr_(nullptr), progress_(0),
+          file_writer_(FileWriter(connectSocket->GetFd())), log_(nullptr),
+          status_(Status::handle_message), filecache_(GetFileCache()),
+          filesize_(0), write_progress_(0) {}
 
     ~HttpRequestWriteListener() override {
         delete connect_socket_;
@@ -166,28 +199,185 @@ class HttpRequestWriteListener : public Listener {
         if (log_ == nullptr) {
             log_ = loop->LOG();
         }
-        std::string data = "HTTP/1.1 200 OK\nContent-Length: 13\nContent-Type: "
-                           "text/html\n\nHello world!\n";
-        auto result = file_writer_.Append(data);
-        if (!result.IsOK()) {
-            log_->Debug(result.str());
+        VoidResult result;
+
+        while (status_ != Status::finish) {
+            switch (status_) {
+            case Status::handle_message: {
+                result = handle_message();
+                break;
+            }
+            case Status::write_header: {
+                result = write_header();
+                break;
+            }
+            case Status::write_body: {
+                result = write_body();
+                break;
+            }
+            default:
+                break;
+            }
+
+            if (!result.IsOK()) {
+                if (result.IsError<HttpAgain>()) {
+                    return;
+                }
+                reader_.Close();
+                // TODO: Log socket info
+                log_->ERROR("" + result.str());
+                break;
+            }
         }
-        result = file_writer_.Flush();
-        if (!result.IsOK()) {
-            log_->Debug(result.str());
-        }
+
+        log_->Debug("");
         loop->RemoveListener(connect_socket_->GetFd(), IOEvent::WRITE);
         delete this;
     }
 
   private:
+    VoidResult handle_message() {
+        MultipartFiles &multipartfiles = res_->files;
+        if (multipartfiles.empty()) {
+            res_->headers.emplace(CONTENT_LENGTH,
+                                  std::to_string(res_->body.size()));
+        } else if (multipartfiles.size() == 1) {
+            File *file = multipartfiles.begin()->second.file;
+            auto filesize = file->GetFileSize();
+            if (!filesize.IsOK()) {
+                return filesize;
+            }
+            res_->headers.emplace(CONTENT_LENGTH,
+                                  std::to_string(filesize.Get()));
+            filesize_ = filesize.Get();
+            if (filesize_ > 2 * 1024 * 1024) { // TODO: const variance
+                reader_ = FileReader(*file);
+            }
+            log_->Debug(file->GetFileName());
+        } else {
+            return VoidResult::ErrorResult<HttpError>(
+                "not support response multipartfiles");
+        }
+        // res_->headers.emplace(CONTENT_TYPE, "text/html");
+        status_ = Status::write_header;
+        return VoidResult::OK();
+    }
+
+    VoidResult write_header() {
+        if (data_ptr_ == nullptr) {
+            data_ptr_ = res_->GetResponseHeader();
+        }
+        auto result = write_len(data_ptr_->data(), data_ptr_->size());
+        if (!result.IsOK()) {
+            return result;
+        }
+        log_->Debug(*data_ptr_);
+        delete data_ptr_;
+        data_ptr_ = nullptr;
+        status_ = Status::write_body;
+        return VoidResult::OK();
+    }
+
+    VoidResult write_body() {
+        if (!res_->body.empty()) {
+            auto result = write_len(res_->body.data(), res_->body.size());
+            if (!result.IsOK()) {
+                return result;
+            }
+        } else {
+            MultipartFiles &multipartfiles = res_->files;
+            File *file = multipartfiles.begin()->second.file;
+            auto cache_entity = filecache_->FileGet(file->GetFileName());
+            if (!cache_entity.IsOK() &&
+                cache_entity.IsError<FileCacheCapabilityError>()) {
+                std::string buf;
+                buf.assign(0, MAX_FILE_READ_SIZE);
+                while (write_progress_ < filesize_) {
+                    auto result = reader_.Read(&buf[0], MAX_FILE_READ_SIZE);
+                    if (!result.IsOK()) {
+                        return result;
+                    }
+
+                    auto write_size = write_len(buf.data(), result.Get());
+                    write_progress_ += result.Get();
+                    if (!write_size.IsOK()) {
+                        return write_size;
+                    }
+                }
+            } else {
+                FileCacheEntity &entity = cache_entity.Get();
+                auto write_size = write_len(entity.data, entity.size);
+                if (!write_size.IsOK()) {
+                    return write_size;
+                }
+		write_progress_ += entity.size;
+            }
+        }
+
+	reader_.Close();
+        auto result = file_writer_.Flush();
+        if (!result.IsOK()) {
+            if (result.IsError<FileAgain>()) {
+                return VoidResult::ErrorResult<HttpAgain>("http write again!");
+            }
+        }
+
+        log_->Debug(string_format("write progress = %d", write_progress_));
+
+        status_ = Status::finish;
+        return VoidResult::OK();
+    }
+
+    VoidResult write_len(const char *data, size_t len) {
+        Result<ssize_t> result;
+        if (write_buf_.empty()) {
+            result = file_writer_.Write(data, len);
+        } else {
+            write_buf_.append(data, len);
+            result = file_writer_.Write(write_buf_.data(), write_buf_.size());
+        }
+        if (!result.IsOK()) {
+            if (result.IsError<FileAgain>()) {
+                if (write_buf_.empty()) {
+                    write_buf_.append(data + result.Get(), len - result.Get());
+                } else {
+                    write_buf_.erase(0, result.Get());
+                }
+                return VoidResult::ErrorResult<HttpAgain>("http write again!");
+            }
+            return result;
+        }
+        write_buf_.clear();
+        return VoidResult::OK();
+    }
+
     HttpServerImpl *server_;
     Socket *connect_socket_;
     HttpRequest *req_;
     HttpResponse *res_;
 
+    std::string *data_ptr_;
+
+    std::string buf_;
+    size_t progress_;
+
     FileWriter file_writer_;
     Log *log_;
+
+    enum class Status {
+        handle_message,
+        write_header,
+        write_body,
+        finish,
+    };
+    Status status_;
+
+    FileCache *filecache_;
+
+    FileReader reader_;
+    std::string write_buf_;
+    size_t filesize_;
+    size_t write_progress_;
 };
 
 class HttpRequestReadListener : public Listener {
@@ -197,7 +387,7 @@ class HttpRequestReadListener : public Listener {
           req_(new HttpRequest), res_(new HttpResponse),
           reader_(FileReader(connect_socket_->GetFd())), log_(nullptr),
           parse_status_(ParseStatus::request_line), buf_progress_(0),
-          body_progress_(0), connect_close_(true) {}
+          body_progress_(0) {}
 
     ~HttpRequestReadListener() override{};
 
@@ -209,7 +399,7 @@ class HttpRequestReadListener : public Listener {
         VoidResult result = handle_request(loop);
 
         if (!result.IsOK()) {
-            if (result.IsError<HttpReadAgain>()) {
+            if (result.IsError<HttpAgain>()) {
                 return;
             }
             // TODO: Log socket info
@@ -228,7 +418,7 @@ class HttpRequestReadListener : public Listener {
     VoidResult handle_request(EventLoop *loop) {
         VoidResult result;
 
-        res_->version = HTTP_V2;
+        res_->version = HTTP_V1_1;
         res_->status = -1;
 
         while (parse_status_ != ParseStatus::finish) {
@@ -274,6 +464,7 @@ class HttpRequestReadListener : public Listener {
             return result;
         }
 
+        log_->Debug(request_line);
         static std::regex re("(GET|HEAD|POST|PUT|DELETE|OPTIONS) "
                              "(([^?]+)(?:\\?(.+?))?) (HTTP/1\\.[01])\r\n");
 
@@ -476,7 +667,7 @@ class HttpRequestReadListener : public Listener {
         size_t offset = 0;
 
         MultipartFileInfo &fileinfo = multipart_file_info_;
-	File **file = &fileinfo.file.file;
+        File **file = &fileinfo.file.file;
         bool is_read_finish = false;
 
         while (body_progress_ != content_length) {
@@ -518,7 +709,8 @@ class HttpRequestReadListener : public Listener {
                 std::string filename =
                     string_format("tmp_%s_%s", fileinfo.name.c_str(),
                                   fileinfo.file.filename.c_str());
-                if (pos < MAX_MULTIPART_READ_SIZE - dash_boundary_size - crlf_size) {
+                if (pos <
+                    MAX_MULTIPART_READ_SIZE - dash_boundary_size - crlf_size) {
                     *file = new MemFile(filename);
                 } else {
                     *file = new File(filename);
@@ -587,8 +779,7 @@ class HttpRequestReadListener : public Listener {
             if (rsize.IsError<FileAgain>()) {
                 buf_progress_ += rsize.Get();
                 log_->Debug(string_format("progress: %d", buf_progress_));
-                return VoidResult::ErrorResult<HttpReadAgain>(
-                    "http read again!");
+                return VoidResult::ErrorResult<HttpAgain>("http read again!");
             }
             return rsize;
         }
@@ -596,8 +787,7 @@ class HttpRequestReadListener : public Listener {
             buf_progress_ += rsize.Get();
             log_->Debug(string_format("progress: %d", buf_progress_));
             if (buf_progress_ != len) {
-                return VoidResult::ErrorResult<HttpReadAgain>(
-                    "http read again!");
+                return VoidResult::ErrorResult<HttpAgain>("http read again!");
             }
         }
         memcpy(buf, buf_.data(), len);
@@ -611,15 +801,14 @@ class HttpRequestReadListener : public Listener {
         if (!result.IsOK()) {
             if (result.IsError<FileAgain>()) {
                 log_->Debug(buf_);
-                return VoidResult::ErrorResult<HttpReadAgain>(
-                    "http read again!");
+                return VoidResult::ErrorResult<HttpAgain>("http read again!");
             };
             return result;
         }
 
         if (buf_.back() != '\n') {
             log_->Debug(buf_);
-            return VoidResult::ErrorResult<HttpReadAgain>("http read again!");
+            return VoidResult::ErrorResult<HttpAgain>("http read again!");
         }
         line.assign(buf_);
         buf_.clear();
@@ -655,13 +844,11 @@ class HttpRequestReadListener : public Listener {
 
     void route_handle() {
         parse_status_ = ParseStatus::finish;
-
+        res_->status = 200;
         if (handle_file_request()) {
             return;
         }
-        if (dispatch_request()) {
-            res_->status = 200;
-        } else {
+        if (!dispatch_request()) {
             res_->status = 404;
         }
     }
@@ -670,7 +857,32 @@ class HttpRequestReadListener : public Listener {
         if (req_->method != GET) {
             return false;
         }
-        return true;
+
+        const HttpServerOption &option = server_->option;
+        std::string file = option.root_dir + req_->path;
+        MultipartFile multipartfile;
+        if (req_->path == "/") {
+            std::vector<std::string> entry_files{"index.html"};
+            VoidResult result;
+            auto it = entry_files.cbegin();
+            for (; it != entry_files.cend(); ++it) {
+                if (File::IsExist(file + *it)) {
+                    file.append(*it);
+                    break;
+                }
+            }
+            if (it == entry_files.end()) {
+                return false;
+            }
+        }
+
+        if (File::IsExist(file)) {
+            multipartfile.file = new File(file);
+            res_->files.emplace(file, multipartfile);
+            return true;
+        }
+        log_->Debug(req_->path);
+        return false;
     }
 
     bool dispatch_request() {
@@ -710,8 +922,6 @@ class HttpRequestReadListener : public Listener {
     ssize_t buf_progress_;
     ssize_t body_progress_;
 
-    std::string body_;
-
     typedef struct MultipartFileInfo {
         std::string name;
         MultipartFile file;
@@ -719,7 +929,7 @@ class HttpRequestReadListener : public Listener {
     MultipartFileInfo multipart_file_info_;
     std::string multipart_data_buf_;
     FileWriter multipart_file_writer_;
-    bool connect_close_;
+
 }; // namespace MyServer
 
 void HttpServerResponseListener::Callback(EventLoop *loop) {
@@ -745,13 +955,31 @@ void HttpServerResponseListener::Callback(EventLoop *loop) {
 
 } // namespace
 
-Result<HttpServer *> HttpServer::NewHttpServer() {
-
-    HttpServer *server = new HttpServerImpl;
+Result<HttpServer *> HttpServer::NewHttpServer(const HttpServerOption &option) {
+    HttpServerImpl *server = new HttpServerImpl(option);
     if (server == nullptr) {
         return VoidResult::ErrorResult<OutOfMemory>();
     }
+    VoidResult result = server->ApplyOption();
+    if (!result.IsOK()) {
+        return result;
+    }
     return server;
+}
+
+std::string *HttpResponse::GetResponseHeader() {
+    std::string *response = new std::string;
+    // response line
+    response->append(string_format("%s %s\r\n", version.c_str(),
+                                   std::to_string(status).c_str()));
+
+    // response header
+    for (auto header : headers) {
+        response->append(string_format("%s: %s\r\n", header.first.c_str(),
+                                       header.second.c_str()));
+    }
+    response->append("\r\n");
+    return response;
 }
 
 } // namespace MyServer

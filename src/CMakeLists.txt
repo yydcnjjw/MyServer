@@ -6,12 +6,10 @@ elseif(APPLE)
   add_definitions(-D_APPLE)
 endif()
 
-
 include_directories(
   ${PROJECT_SOURCE_DIR}/src)
 
 set(SOURCE_FILES
-  main.cc
   core/event_loop.h
   core/event_loop.cc
   core/event_listener.h
@@ -25,11 +23,6 @@ set(SOURCE_FILES
   utils/error_util.cc
   utils/file_util.h
   utils/file_util.cc
-  # utils/env.h
-  # utils/env.cc
-  # utils/env_poxiv.cc
-  # utils/status.h
-  # utils/status.cc
   utils/string_util.h
   utils/string_util.cc
   utils/log.h
@@ -40,9 +33,18 @@ add_executable(MyServer "")
 
 target_sources(MyServer
   PRIVATE
-  ${SOURCE_FILES})
+  ${SOURCE_FILES}
+  main.cc)
+
+target_link_libraries(MyServer PRIVATE
+  stdc++fs
+  )
+# Threads::Threads
 
 add_library(libMyServer "")
 target_sources(libMyServer
   PRIVATE
   ${SOURCE_FILES})
+target_link_libraries(libMyServer PRIVATE
+  stdc++fs
+  )

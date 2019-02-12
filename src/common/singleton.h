@@ -8,7 +8,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace MyServer {
+namespace Utils {
 template <typename InstanceType> class Singleton {
   public:
     template <typename... ConstructorArgTypes>

@@ -48,7 +48,9 @@ const std::string output_special_char(const std::string &str) {
 Log::Log(LogOption option)
     : logfile_(option.logfile.empty() ? "LOG.log" : option.logfile),
       outputLevel_(option.outputLevel) {}
-Log::~Log() {}
+Log::~Log() {
+    logfile_.Flush();    
+}
 
 VoidResult Log::Debug(const std::string &msg) {
     return log(LogLevel::DEBUG, msg);
@@ -85,13 +87,12 @@ VoidResult Log::log(LogLevel level, const std::string &msg) {
     format_msg << type << ": ";
     
     // TODO: std out
-    if (true) {
-	printf("%s%s\n", format_msg.str().c_str(), output_special_char(msg).c_str());
-    }
+    // if (true) {
+    // 	printf("%s%s\n", format_msg.str().c_str(), output_special_char(msg).c_str());
+    // }
 
     format_msg << msg << "\n";
-    logfile_.Append(format_msg.str());
-    return logfile_.Flush();
+    return logfile_.Append(format_msg.str());
 }
 
 std::string Log::getLabel(LogLevel level) {
