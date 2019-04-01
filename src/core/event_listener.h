@@ -12,9 +12,11 @@ class Listener;
 class Listener {
   public:
     virtual ~Listener() = default;
-    // static Listener *NewListener(ListenerCallBack);
     virtual void Callback(EventLoop *) = 0;
 };
+
+typedef double Time;
+typedef uint TimerId;
 
 // class EventLoopCycleListener : public Listener {
 //   public:

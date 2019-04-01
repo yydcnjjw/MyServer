@@ -22,18 +22,16 @@ class Error {
 
 class VoidResult {
   public:
-    VoidResult() : status_(Status::SUCCESS), error_(new Error) {}
+    VoidResult()
+        : status_(Status::SUCCESS), error_(std::make_shared<Error>()) {}
 
     static VoidResult OK() { return VoidResult(); }
 
     template <typename ErrorType, typename... ConstructorArgTypes>
     static VoidResult ErrorResult(const std::string &msg = "",
                                   ConstructorArgTypes &&... constructor_args) {
-        return VoidResult(msg, new ErrorType(std::forward<ConstructorArgTypes>(
-                                   constructor_args)...));
-    }
-
-    static VoidResult ErrorResult(Error *error, const std::string &msg = "") {
+        Error *error = new ErrorType(
+            std::forward<ConstructorArgTypes>(constructor_args)...);
         return VoidResult(msg, error);
     }
 
@@ -43,12 +41,14 @@ class VoidResult {
         return instanceof <Class>(error_.get());
     }
 
+    Error *GetError() const { return error_.get(); }
+
     std::string str() { return error_->str(msg_); };
 
   private:
     VoidResult(const std::string &msg, Error *e)
         : status_(Status::FAILURE), error_(e), msg_(msg) {}
-    
+
     enum class Status { SUCCESS, FAILURE };
     Status status_;
 
@@ -64,9 +64,10 @@ template <typename Value> class Result : public VoidResult {
     Result(const Result<Type> &result) : VoidResult(result) {}
     Result(const VoidResult &result) : VoidResult(result) {}
 
+    Result(Value value, const VoidResult &&result)
+        : VoidResult(result), value_(value) {}
     Result(Value value, const VoidResult &result)
         : VoidResult(result), value_(value) {}
-
     Value &Get() { return value_; }
 
   private:

@@ -1,5 +1,6 @@
-debug
-.ccls-cache
+/debug/
+/build/
+/.ccls-cache/
 
 .ccls-root
 .projectile

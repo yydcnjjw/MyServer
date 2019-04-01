@@ -5,12 +5,31 @@
 #include "utils/file_util.h"
 
 using namespace std;
+using namespace Utils;
 int main(int argc, char *argv[]) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
 
+VoidResult errorTest() {
+    VoidResult ok;
+    Error *error = ok.GetError();
+    cout << "error " << error << endl;
+    cout << ok.str() << endl;
+
+    ok = VoidResult::ErrorResult<OutOfMemory>();
+    Error *error1 = ok.GetError();
+    cout << "error1 " << error1 << endl;
+    cout << ok.str() << endl;
+    
+    return ok;
+}
+
 TEST(ErrorTest, error) {
+    VoidResult ok = errorTest();
+    cout << ok.GetError() << endl;
+    cout << ok.str() << endl;
+
     Utils::VoidResult result =
         Utils::VoidResult::ErrorResult<Utils::SysError>("syserror", 10);
     cout << result.str() << endl;

@@ -12,9 +12,6 @@
 
 namespace MyServer {
 using namespace Utils;
-
-enum IOEvent { READ = 0x1, WRITE = 0x2 };
-
 class EventLoop {
   public:
     EventLoop() = default;
@@ -27,6 +24,8 @@ class EventLoop {
 
     virtual VoidResult AddListener(FileDesc, IOEvent, Listener *) = 0;
     virtual VoidResult RemoveListener(FileDesc, IOEvent) = 0;
+    virtual Result<TimerId> AddTimer(Time after, Listener *) = 0;
+    virtual Result<Listener *> RemoveTimer(TimerId) = 0;
 
     virtual Log *LOG() = 0;
 };

@@ -87,9 +87,9 @@ VoidResult Log::log(LogLevel level, const std::string &msg) {
     format_msg << type << ": ";
     
     // TODO: std out
-    // if (true) {
-    // 	printf("%s%s\n", format_msg.str().c_str(), output_special_char(msg).c_str());
-    // }
+    if (true) {
+    	printf("%s%s\n", format_msg.str().c_str(), output_special_char(msg).c_str());
+    }
 
     format_msg << msg << "\n";
     return logfile_.Append(format_msg.str());

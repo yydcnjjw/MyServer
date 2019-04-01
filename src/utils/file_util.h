@@ -51,6 +51,7 @@ enum class FileType {
 
 class File {
   public:
+    File();
     File(const std::string &filename);
     File(FileDesc fileDesc);
     ~File();
@@ -130,7 +131,7 @@ class FileWriter {
     VoidResult flushBuffer();
     Result<ssize_t> writeUnbufferd(const char *data, size_t size);
     FileDesc file_desc_;
-    std::shared_ptr<char> buf_;
+    std::shared_ptr<char[]> writebuf_;
     size_t pos_;
     size_t rear_pos_;
     VoidResult is_open_;
@@ -146,7 +147,7 @@ class FileReader {
     ~FileReader();
 
     Result<FileDesc> getFd() const;
-    Result<bool> IsOpen() const;
+    VoidResult IsOpen() const;
 
     virtual Result<ssize_t> Read(char *, const size_t size);
     virtual Result<ssize_t> Read(char *);
@@ -160,7 +161,7 @@ class FileReader {
     void open(const std::string &path);
     Result<ssize_t> read(char *, size_t size);
     FileDesc file_desc_;
-    std::shared_ptr<char> readbuf_;
+    std::shared_ptr<char[]> readbuf_;
     ssize_t readcnt_;
     char *readptr_;
     VoidResult is_open_;
@@ -170,7 +171,7 @@ class MMapFileReader : public FileReader {
   public:
 };
 typedef uint IOEventFlag;
-enum IOEvent { READ = 0x1, WRITE = 0x2 };
+enum IOEvent { READ = 0x1, WRITE = 0x2, ERR = 0x4 };
 
 union PollData {
     FileDesc fd;

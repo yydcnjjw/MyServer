@@ -38,6 +38,9 @@ VoidResult FilePosixError(const std::string &filename = "",
 }
 
 VoidResult SocketPosixError(const std::string &msg = "") {
+    if (errno == EAGAIN) {
+        return VoidResult::ErrorResult<SysError>(msg, errno);
+    }
     return VoidResult::ErrorResult<SocketError>(msg + ": " +
                                                 std::strerror(errno));
 }
@@ -85,11 +88,15 @@ class EPollIOPoll final : public IOPoll {
         int nr_events = epoll_wait(epfd_, events, nr_fdwatcher_, timeout);
         if (nr_events < 0) {
             free(events);
+            if (errno == EINTR) {
+                return VoidResult::OK();
+            }
             return FilePosixError("", "epoll wait");
         }
         PollEvent event;
         for (int i = 0; i < nr_events; i++) {
             uint32_t flag = events[i].events;
+            // printf("poll fd=%d, events=%p\n", events[i].data, flag);
             event.event = 0;
             if (flag & (EPOLLIN | EPOLLRDNORM)) {
                 event.event |= IOEvent::READ;
@@ -97,6 +104,10 @@ class EPollIOPoll final : public IOPoll {
 
             if (flag & (EPOLLOUT | EPOLLWRNORM)) {
                 event.event |= IOEvent::WRITE;
+            }
+
+            if ((flag & EPOLLERR) || (flag & EPOLLRDHUP)) {
+                event.event |= IOEvent::ERR;
             }
 
             memcpy(&event.data, &events[i].data, sizeof(PollData));
@@ -109,15 +120,12 @@ class EPollIOPoll final : public IOPoll {
     };
 
   private:
-    int epfd_;
-    int nr_fdwatcher_;
-
     VoidResult controlEPoll(int controlflag, FdWatcher &watchFD) {
         struct epoll_event event;
         IOEventFlag eventflag = watchFD.event;
+        event.events = 0;
+        memcpy(&event.data, &watchFD.data, sizeof(PollData));
         if (controlflag != EPOLL_CTL_DEL) {
-            event.events = 0;
-            memcpy(&event.data, &watchFD.data, sizeof(PollData));
             if (eventflag & IOEvent::WRITE) {
                 event.events |= (EPOLLOUT | EPOLLWRNORM);
             }
@@ -127,12 +135,26 @@ class EPollIOPoll final : public IOPoll {
             }
         }
 
+        // if (controlflag == EPOLL_CTL_DEL) {
+        //     printf("del ");
+        // }
+        // if (controlflag == EPOLL_CTL_ADD) {
+        //     printf("add ");
+        // }
+        // if (controlflag == EPOLL_CTL_MOD) {
+        //     printf("mod ");
+        // }
+
+        // printf("control fd=%d, events=%p\n", watchFD.fd, event.events);
+
         int ret = epoll_ctl(epfd_, controlflag, watchFD.fd, &event);
-        if (ret) {
+        if (ret == -1) {
             return FilePosixError("epoll_ctl");
         }
         return VoidResult::OK();
     }
+    int epfd_;
+    int nr_fdwatcher_;
 };
 
 // class SelectFDWatcher final : public FDWatcher {
@@ -144,13 +166,15 @@ class EPollIOPoll final : public IOPoll {
 
 } // namespace
 
+File::File() : File(-1) {}
+
 File::File(const std::string &filename)
     : filedesc_(-1), filename_(filename), dirname_(dirname(filename)) {}
 
 File::File(FileDesc fileDesc)
     : filedesc_(fileDesc), filename_(""), dirname_("") {}
 
-File::~File() {}
+File::~File() { Close(); }
 
 VoidResult File::Close() {
     if (IsOpen()) {
@@ -189,7 +213,7 @@ bool File::IsExist() {
 
 VoidResult File::Seek(const off_t offset, int whence) {
     if (!IsOpen()) {
-        return VoidResult::ErrorResult(new FileNotFound(filename_), "");
+        return VoidResult::ErrorResult<FileNotFound>("", filename_);
     }
     if (-1 == lseek(filedesc_, offset, whence)) {
         return FilePosixError(filename_);
@@ -276,16 +300,14 @@ class PosixSocket : public Socket {
     }
 
     Result<Socket *> Accept() override {
-        Socket *connectSocket;
-        struct sockaddr conSockaddr = {0};
-        socklen_t len = sizeof(conSockaddr);
-        int connectfd = accept(socketfd_, &conSockaddr, &len);
+        struct sockaddr *conSockaddr =
+            (struct sockaddr *)Malloc(sizeof(struct sockaddr));
+        socklen_t len = sizeof(struct sockaddr);
+        int connectfd = accept(socketfd_, conSockaddr, &len);
         if (connectfd == -1) {
             return SocketPosixError("accept");
         }
-        struct sockaddr *addr = (struct sockaddr *)Malloc(len);
-        ::memcpy(addr, &conSockaddr, len);
-        connectSocket = new PosixSocket(connectfd, addr, len);
+        Socket *connectSocket = new PosixSocket(connectfd, conSockaddr, len);
         if (connectSocket == nullptr) {
             return VoidResult::ErrorResult<OutOfMemory>();
         }
@@ -371,16 +393,17 @@ FileWriter::FileWriter(const std::string &path, bool append) : FileWriter() {
 }
 
 FileWriter::FileWriter(const FileDesc fileDesc)
-    : file_desc_(fileDesc), buf_(new char[FILE_BUFFER_SIZE]), pos_(0),
-      rear_pos_(0) {
+    : file_desc_(fileDesc), writebuf_(new char[FILE_BUFFER_SIZE]), pos_(0), rear_pos_(0) {
     if (fileDesc == -1) {
-        is_open_ = VoidResult::ErrorResult(new FileNotFound(""));
+        is_open_ = VoidResult::ErrorResult<FileNotFound>("", "");
     } else {
         is_open_ = VoidResult::OK();
     }
 }
 
-FileWriter::~FileWriter() { flushBuffer(); }
+FileWriter::~FileWriter() {
+    flushBuffer();
+}
 
 Result<FileDesc> FileWriter::getFd() const {
     if (!IsOpen().IsOK()) {
@@ -400,8 +423,10 @@ Result<ssize_t> FileWriter::Write(const char *buf, size_t size) {
 }
 Result<ssize_t> FileWriter::Write(const char ch) { return append(&ch, 1); }
 VoidResult FileWriter::Close() {
-    if (::close(file_desc_) == -1) {
-        return FilePosixError();
+    if (IsOpen().IsOK()) {
+        if (::close(file_desc_) == -1) {
+            return FilePosixError();
+        }
     }
     return VoidResult::OK();
 }
@@ -427,13 +452,14 @@ Result<ssize_t> FileWriter::append(const char *write_data, size_t write_size) {
     }
 
     size_t copy_size = std::min(write_size, FILE_BUFFER_SIZE - pos_);
-    std::memcpy(buf_.get() + pos_, write_data, copy_size);
+    std::memcpy(writebuf_.get() + pos_, write_data, copy_size);
     write_data += copy_size;
     write_size -= copy_size;
     pos_ += copy_size;
 
+    VoidResult ok = VoidResult::OK();
     if (write_size == 0) {
-        return Result<ssize_t>(copy_size, VoidResult::OK());
+        return Result<ssize_t>(copy_size, ok);
     }
 
     auto result = flushBuffer();
@@ -442,9 +468,9 @@ Result<ssize_t> FileWriter::append(const char *write_data, size_t write_size) {
     }
 
     if (write_size < FILE_BUFFER_SIZE) {
-        std::memcpy(buf_.get(), write_data, write_size);
+        std::memcpy(writebuf_.get(), write_data, write_size);
         pos_ = write_size;
-        return Result<ssize_t>(copy_size + write_size, VoidResult::OK());
+        return Result<ssize_t>(copy_size + write_size, ok);
     }
 
     Result<ssize_t> write_len = writeUnbufferd(write_data, write_size);
@@ -477,7 +503,7 @@ VoidResult FileWriter::Sync() {
 
 VoidResult FileWriter::flushBuffer() {
     Result<ssize_t> result;
-    result = writeUnbufferd(buf_.get() + rear_pos_, pos_ - rear_pos_);
+    result = writeUnbufferd(writebuf_.get() + rear_pos_, pos_ - rear_pos_);
     if (!result.IsOK()) {
         if (result.IsError<FileAgain>()) {
             rear_pos_ += result.Get();
@@ -518,10 +544,11 @@ FileReader::FileReader(const File &file) : FileReader() {
 
 FileReader::FileReader(const std::string &path) : FileReader() { open(path); }
 FileReader::FileReader(const FileDesc fileDesc)
-    : file_desc_(fileDesc), readbuf_(new char[FILE_BUFFER_SIZE]), readcnt_(0),
-      readptr_(readbuf_.get()) {
+    : file_desc_(fileDesc), readbuf_(new char[FILE_BUFFER_SIZE]), readcnt_(0) {
+    readptr_ = readbuf_.get();
+
     if (fileDesc == -1) {
-        is_open_ = VoidResult::ErrorResult(new FileNotFound(""));
+        is_open_ = VoidResult::ErrorResult<FileNotFound>("", "");
     } else {
         is_open_ = VoidResult::OK();
     }
@@ -545,28 +572,12 @@ Result<FileDesc> FileReader::getFd() const {
     }
     return file_desc_;
 }
-Result<bool> FileReader::IsOpen() const { return is_open_; }
+VoidResult FileReader::IsOpen() const { return is_open_; }
 
 Result<ssize_t> FileReader::Read(char *buf, const size_t size) {
     return read(buf, size);
 }
 Result<ssize_t> FileReader::Read(char *ch) { return read(ch, 1); }
-
-// Result FileReader::Read(char *buf, size_t size, ssize_t offset,
-//                         ssize_t *rsize) {
-//     if (!IsOpen()) {
-//         return isOpen_;
-//     }
-// again:
-//     *rsize = ::pread(fileDesc_, buf, size, offset);
-//     if (*rsize < 0) {
-//         if (errno == EINTR) {
-//             goto again;
-//         }
-//         return FilePosixError("");
-//     }
-//     return Result::OK();
-// }
 
 VoidResult FileReader::ReadLine(std::string &str) {
     char c;
@@ -584,8 +595,10 @@ VoidResult FileReader::ReadLine(std::string &str) {
 }
 
 VoidResult FileReader::Close() {
-    if (::close(file_desc_) == -1) {
-        return FilePosixError();
+    if (IsOpen().IsOK()) {
+        if (::close(file_desc_) == -1) {
+            return FilePosixError();
+        }
     }
     return VoidResult::OK();
 }
@@ -663,7 +676,7 @@ Result<FileCacheEntity> FileCache::FileGet(const std::string &key) {
     if (!file_size.IsOK()) {
         return FilePosixError(key);
     }
- 
+
     if (file_size.Get() > option_.max_file_size ||
         CacheTotal() + file_size.Get() > option_.file_cache_apability) {
         return VoidResult::ErrorResult<FileCacheCapabilityError>();
@@ -692,7 +705,7 @@ Result<FileCacheEntity> FileCache::FileGet(const std::string &key) {
 
 size_t FileCache::CacheTotal() const { return cached_size_; }
 
-FileCache* GetFileCache() {
+FileCache *GetFileCache() {
     static Singleton<FileCache> singletion;
     return singletion.get();
 }

@@ -27,6 +27,10 @@ typedef struct MultipartFile {
     std::string content_type;
     File *file = nullptr;
     size_t length = 0;
+    ~MultipartFile() {
+	if (file != nullptr)
+	    delete file;
+    }
 } MultipartFile;
 typedef std::multimap<std::string, MultipartFile> MultipartFiles;
 
@@ -41,7 +45,7 @@ class HttpResponse : public HttpMessage {
   public:
     int status;
     std::string body;
-    std::string *GetResponseHeader();
+    void GetResponseHeader(std::string&);
 };
 
 class HttpRequest : public HttpMessage {
@@ -74,11 +78,11 @@ class HttpServer : public Server {
 
     virtual HttpServer *Get(const std::string &, HttpHandleFunc) = 0;
     virtual HttpServer *Post(const std::string &, HttpHandleFunc) = 0;
-    
+
     virtual VoidResult Start() override = 0;
     virtual VoidResult Stop() override = 0;
     virtual VoidResult Restart() override = 0;
-    
+
     virtual VoidResult addToEventLoop(EventLoop *) override = 0;
 };
 
